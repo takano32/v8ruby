@@ -12,4 +12,4 @@ puts defined?(Debug).inspect
 require "bundler"
 Bundler.require(:default)
 puts Rainbow("required").blue.inspect
-puts Bundler.root.end_with?("bundle_app")
+puts Bundler.root.to_s.end_with?("bundle_app")
