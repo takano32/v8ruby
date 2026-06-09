@@ -1,0 +1,13 @@
+{
+  "name": "v8ruby",
+  "version": "0.1.0",
+  "description": "A Ruby implementation that compiles Ruby to JavaScript and runs it on the V8 engine",
+  "type": "module",
+  "bin": {
+    "v8ruby": "./bin/v8ruby.js"
+  },
+  "scripts": {
+    "test": "node test/run.js"
+  },
+  "license": "MIT"
+}
