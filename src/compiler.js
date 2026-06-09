@@ -68,11 +68,7 @@ function analyze(node, scope) {
       return;
     }
     case 'MultiAssign': {
-      for (const t of node.targets) {
-        if (t.type === 'Ident') declareLocal(scope, t.name);
-        else if (t.type === 'SplatTarget') { if (t.target && t.target.type === 'Ident') declareLocal(scope, t.target.name); else analyze(t.target, scope); }
-        else analyze(t, scope);
-      }
+      for (const t of node.targets) declareTarget(scope, t);
       analyze(node.values, scope);
       return;
     }
@@ -159,6 +155,13 @@ function analyze(node, scope) {
   }
 }
 
+function declareTarget(scope, t) {
+  if (t.type === 'Ident') declareLocal(scope, t.name);
+  else if (t.type === 'SplatTarget') { if (t.target) declareTarget(scope, t.target); }
+  else if (t.type === 'MlhsGroup') { for (const sub of t.targets) declareTarget(scope, sub); }
+  else analyze(t, scope);
+}
+
 function analyzeBlock(block, scope) {
   const params = collectParamNames(block.params);
   const s = new Scope('block', scope, params);
@@ -234,6 +237,7 @@ export class Compiler {
       case 'Break': return this.genBreak(node);
       case 'Next': return this.genNext(node);
       case 'Redo': return 'throw new R.RedoError();';
+      case 'Retry': return 'throw new R.RetryError();';
       case 'Class': return this.genClass(node) + ';';
       case 'Module': return this.genModule(node) + ';';
       case 'Def': return this.gen(node) + ';';
@@ -481,16 +485,20 @@ export class Compiler {
       rhs = '[' + node.values.map((v) =>
         v.type === 'Splat' ? `...R.splat(${this.gen(v.value)})` : this.gen(v)).join(', ') + ']';
     }
+    return this.genDestructure(node.targets, rhs);
+  }
+
+  genDestructure(targets, rhsExpr) {
+    const splatIndex = targets.findIndex((t) => t.type === 'SplatTarget');
+    const count = targets.length;
     const d = this.t();
-    const assigns = node.targets.map((t, i) => {
+    const assigns = targets.map((t, i) => {
       const valExpr = `${d}[${i}]`;
-      if (t.type === 'SplatTarget') {
-        if (!t.target) return '';
-        return this.assignTo(t.target, valExpr);
-      }
+      if (t.type === 'SplatTarget') return t.target ? this.assignTo(t.target, valExpr) : '';
+      if (t.type === 'MlhsGroup') return this.genDestructure(t.targets, valExpr);
       return this.assignTo(t, valExpr);
     }).filter(Boolean);
-    return `(() => { const ${d} = R.destructure(${rhs}, ${count}, ${splatIndex}); ${assigns.map((a) => a + ';').join(' ')} return ${d}; })()`;
+    return `(() => { const ${d} = R.destructure(${rhsExpr}, ${count}, ${splatIndex}); ${assigns.map((a) => a + ';').join(' ')} return ${d}; })()`;
   }
 
   // ---- control flow -------------------------------------------------------
@@ -609,12 +617,15 @@ export class Compiler {
       : emit(node.body);
     function emit2(self, body, r) { return body.map((s) => self.genStmt(s)).join('\n'); }
 
-    let out = 'try {\n' + tryBody + '\n}';
+    const useRetry = node.rescues.some((r) => hasRetry(r.body));
+
+    let core = tryBody;
     if (node.rescues.length) {
+      core = 'try {\n' + tryBody + '\n}';
       const errv = '$err';
-      out += ` catch (${errv}) {\n`;
-      out += `if (${errv} instanceof R.ReturnError || ${errv} instanceof R.BreakError || ${errv} instanceof R.NextError) throw ${errv};\n`;
-      out += `const $exc = (${errv} instanceof R.RubyError) ? ${errv}.rubyObj : R.wrapJsError(${errv});\n`;
+      core += ` catch (${errv}) {\n`;
+      core += `if (${errv} instanceof R.ReturnError || ${errv} instanceof R.BreakError || ${errv} instanceof R.NextError || ${errv} instanceof R.RetryError) throw ${errv};\n`;
+      core += `const $exc = (${errv} instanceof R.RubyError) ? ${errv}.rubyObj : R.wrapJsError(${errv});\n`;
       let first = true;
       for (const r of node.rescues) {
         let cond;
@@ -623,16 +634,23 @@ export class Compiler {
         } else {
           cond = r.classes.map((c) => `R.isA($exc, ${this.gen(c)})`).join(' || ');
         }
-        out += `${first ? '' : 'else '}if (${cond}) {\n`;
-        if (r.varName) { declareLocal(this.scope, r.varName); out += `${this.local(r.varName)} = $exc;\n`; }
-        out += emit(r.body) + '\n}\n';
+        core += `${first ? '' : 'else '}if (${cond}) {\n`;
+        if (r.varName) { declareLocal(this.scope, r.varName); core += `${this.local(r.varName)} = $exc;\n`; }
+        core += emit(r.body) + '\n}\n';
         first = false;
       }
-      out += `else { throw ${errv}; }\n`;
-      out += '}';
+      core += `else { throw ${errv}; }\n`;
+      core += '}';
     }
+
+    if (useRetry) {
+      const lbl = '$retry' + (++this.tmp);
+      core = `${lbl}: while (true) {\ntry {\n${core}\n} catch ($rt) {\nif ($rt instanceof R.RetryError) continue ${lbl};\nthrow $rt;\n}\nbreak ${lbl};\n}`;
+    }
+
+    let out = core;
     if (node.ensureBody) {
-      out += ` finally {\n${this.genStmts(node.ensureBody)}\n}`;
+      out = `try {\n${core}\n} finally {\n${this.genStmts(node.ensureBody)}\n}`;
     }
     return out;
   }
@@ -857,4 +875,19 @@ export function compile(source) {
 
 function countReqPos(positional) {
   return positional.filter((p) => p.kind === 'req' || p.kind === 'destructure').length;
+}
+
+// Does this subtree contain a `retry` for the current begin? Don't descend into
+// nested scopes (def/class/module/lambda) or a nested begin.
+function hasRetry(node) {
+  if (node == null) return false;
+  if (Array.isArray(node)) return node.some(hasRetry);
+  if (typeof node !== 'object' || !node.type) return false;
+  if (node.type === 'Retry') return true;
+  if (['Def', 'Class', 'Module', 'Lambda', 'SingletonClass', 'Begin'].includes(node.type)) return false;
+  for (const k of Object.keys(node)) {
+    if (k === 'type' || k.startsWith('__')) continue;
+    if (hasRetry(node[k])) return true;
+  }
+  return false;
 }

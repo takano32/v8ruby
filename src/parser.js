@@ -148,7 +148,8 @@ export class Parser {
         if (this.atOp('=')) break; // trailing comma form
         targets.push(this.parseMlhsItem());
       }
-      if (!sawComma || !this.atOp('=')) { this.i = start; return null; }
+      const grouped = targets[0].type === 'MlhsGroup' || targets[0].type === 'SplatTarget';
+      if (!this.atOp('=') || (!sawComma && !grouped)) { this.i = start; return null; }
       this.advance(); // '='
       this.skipNL();
       const values = [this.parseTernary()];
@@ -175,6 +176,13 @@ export class Parser {
       this.advance();
       if (this.atOp(',') || this.atOp('=')) return N('SplatTarget', { target: null });
       return N('SplatTarget', { target: this.parseLValue() });
+    }
+    if (this.atOp('(')) {
+      this.advance();
+      const targets = [this.parseMlhsItem()];
+      while (this.atOp(',')) { this.advance(); if (this.atOp(')')) break; targets.push(this.parseMlhsItem()); }
+      this.expectOp(')');
+      return N('MlhsGroup', { targets });
     }
     return this.parseLValue();
   }

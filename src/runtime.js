@@ -90,6 +90,7 @@ class BreakError { constructor(value) { this.value = value; } }
 class NextError { constructor(value) { this.value = value; } }
 class ReturnError { constructor(value) { this.value = value; } }
 class RedoError {}
+class RetryError {}
 class StopIterationSignal { constructor(value) { this.value = value; } }
 // A thrown Ruby exception object.
 class RubyError extends Error {
@@ -540,7 +541,7 @@ const R = {
   toS, inspect,
 
   // exceptions
-  RubyError, BreakError, NextError, ReturnError, RedoError, StopIterationSignal,
+  RubyError, BreakError, NextError, ReturnError, RedoError, RetryError, StopIterationSignal,
   raise: rbRaise,
   raiseError,
 
@@ -1078,6 +1079,8 @@ function installString() {
   def(S, 'concat', (s, a) => { for (const x of a) s.value += toS(x); return s; });
   def(S, 'prepend', (s, a) => { s.value = a.map(toS).join('') + s.value; return s; });
   def(S, '%', (s, a) => new RString(sprintf(s.value, Array.isArray(a[0]) ? a[0] : [a[0]])));
+  def(S, '+@', (s) => (s.__frozen ? new RString(s.value) : s));
+  def(S, '-@', (s) => { s.__frozen = true; return s; });
   def(S, '==', (s, a) => a[0] instanceof RString && s.value === a[0].value);
   def(S, 'eql?', (s, a) => a[0] instanceof RString && s.value === a[0].value);
   def(S, '<=>', (s, a) => (a[0] instanceof RString ? (s.value < a[0].value ? -1 : s.value > a[0].value ? 1 : 0) : null));
