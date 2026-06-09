@@ -1708,7 +1708,7 @@ function installModuleClass() {
   def(ModuleC, 'include', (s, a) => { for (const m of a) includeModule(s, m); return s; });
   def(ModuleC, 'prepend', (s, a) => { for (const m of a) includeModule(s, m); return s; });
   def(ModuleC, 'include?', (s, a) => s.includes.includes(a[0]));
-  def(ModuleC, 'ancestors', (s) => { const out = []; let c = s; while (c) { out.push(c); for (const m of c.includes) out.push(m); c = c.superclass; } return out; });
+  def(ModuleC, 'ancestors', (s) => { const out = []; let c = s; while (c) { out.push(c); for (let i = c.includes.length - 1; i >= 0; i--) if (!out.includes(c.includes[i])) out.push(c.includes[i]); c = c.superclass; } return out; });
   def(ModuleC, 'attr_accessor', (s, a) => defineAttr(s, 'attr_accessor', a.map((x) => x instanceof RSymbol ? x.name : jsstr(x))));
   def(ModuleC, 'attr_reader', (s, a) => defineAttr(s, 'attr_reader', a.map((x) => x instanceof RSymbol ? x.name : jsstr(x))));
   def(ModuleC, 'attr_writer', (s, a) => defineAttr(s, 'attr_writer', a.map((x) => x instanceof RSymbol ? x.name : jsstr(x))));
