@@ -260,9 +260,14 @@ export function installLoader({ argv = [], programName = 'v8ruby', extraLoadPath
   def('load', (self, args) => loadFile(jstr(args[0])));
   def('__dir__', () => { const c = currentFile(); return c ? R.str(dirname(c)) : null; });
   def('gem', (self, args) => {
-    // During Gemfile DSL capture (Bundler.require), just record the call.
+    // During Gemfile DSL capture (Bundler.require), just record the call
+    // along with the `group … do` blocks currently in effect.
     const cap = R.gvarGet('$__gemfile_capture');
-    if (Array.isArray(cap)) { cap.push(args); return true; }
+    if (Array.isArray(cap)) {
+      const groups = R.gvarGet('$__gemfile_groups');
+      cap.push([args, Array.isArray(groups) ? groups.slice() : []]);
+      return true;
+    }
     const name = jstr(args[0]);
     const version = args.length > 1 && args[1] && !(args[1] instanceof R.RHash) ? jstr(args[1]).replace(/^[~><=\s]+/, '') : null;
     if (!activateGem(name, version)) raiseLoadError(`cannot activate gem -- ${name}`);

@@ -324,7 +324,8 @@ export class Parser {
       if (hasParen) this.advance();
       const operand = this.parseExpression();
       if (hasParen) this.expectOp(')');
-      return N('Defined', { operand });
+      // allow method chains on the result: defined?(X).inspect
+      return this.parsePostfixFrom(N('Defined', { operand }));
     }
     return this.parsePow();
   }
@@ -341,7 +342,11 @@ export class Parser {
 
   // ---- postfix: method chains, indexing, calls, blocks --------------------
   parsePostfix() {
-    let node = this.parsePrimary();
+    return this.parsePostfixFrom(this.parsePrimary());
+  }
+
+  parsePostfixFrom(start) {
+    let node = start;
     while (true) {
       // leading-dot continuation: `foo\n  .bar`
       if (this.atType('NEWLINE')) {

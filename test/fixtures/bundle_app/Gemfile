@@ -1,0 +1,8 @@
+source "https://rubygems.org"
+
+gem "rainbow", "~> 3.1"
+gem "colorator"
+
+group :development do
+  gem "debug", require: false
+end
