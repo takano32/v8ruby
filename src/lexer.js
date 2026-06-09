@@ -58,6 +58,8 @@ export class Lexer {
     for (let i = this.tokens.length - 1; i >= 0; i--) {
       const t = this.tokens[i];
       if (t.type === 'NEWLINE') continue;
+      // closing brackets end a value -> a following / % << is a binary operator
+      if (t.type === 'OP' && (t.value === ')' || t.value === ']' || t.value === '}')) return false;
       // after these, a new value/expression begins
       if (t.type === 'OP') return true;
       if (t.type === 'KEYWORD' && t.value !== 'end' && t.value !== 'self' &&

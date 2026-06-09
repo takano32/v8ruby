@@ -263,11 +263,11 @@ export class Parser {
     const cond = this.parseRange();
     if (this.atOp('?')) {
       this.advance(); this.skipNL();
-      const then = this.parseTernary();
+      const then = this.parseAssign();
       this.skipNL();
       this.expectOp(':');
       this.skipNL();
-      const els = this.parseTernary();
+      const els = this.parseAssign();
       return N('Ternary', { cond, then, else: els });
     }
     return cond;
