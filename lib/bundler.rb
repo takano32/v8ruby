@@ -6,6 +6,7 @@
 # to `require` each gem (Bundler.require).
 
 require "rubygems"
+require "pathname"
 
 module Bundler
   VERSION = "0.1.0 (v8ruby shim)"
@@ -40,7 +41,7 @@ module Bundler
   def self.root
     gf = default_gemfile
     raise GemfileNotFound, "Could not locate Gemfile" unless gf
-    File.dirname(gf)
+    Pathname.new(File.dirname(gf))
   end
 
   # Parse Gemfile.lock: returns [gems, path_libs] where gems is

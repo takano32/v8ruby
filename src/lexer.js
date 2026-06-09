@@ -146,7 +146,13 @@ export class Lexer {
     // Regex literal /pattern/flags (vs division — use value context + spacing).
     if (c === '/' && (this.prevAllowsValue() ||
         (this.spaceBefore && this.peek(1) !== ' ' && this.peek(1) !== '=' && this.peek(1) !== undefined))) {
-      return this.scanRegex();
+      // …but after `def` or `.` a slash is an operator-method name
+      let j = this.tokens.length - 1;
+      while (j >= 0 && this.tokens[j].type === 'NEWLINE') j--;
+      const prev = j >= 0 ? this.tokens[j] : null;
+      const isDefName = prev && ((prev.type === 'KEYWORD' && prev.value === 'def') ||
+        (prev.type === 'OP' && prev.value === '.'));
+      if (!isDefName) return this.scanRegex();
     }
 
     if (isDigit(c)) return this.scanNumber();
