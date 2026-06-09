@@ -28,7 +28,7 @@ const ASSIGN_OPS = new Set([
 // Tokens that can begin a command-call argument (paren-less call).
 const ARG_START_TYPES = new Set([
   'INT', 'FLOAT', 'STRING', 'SYMBOL', 'IDENT', 'CONST', 'IVAR', 'CVAR', 'GVAR',
-  'LABEL', 'WORDS',
+  'LABEL', 'WORDS', 'REGEX',
 ]);
 
 export class Parser {
@@ -567,6 +567,12 @@ export class Parser {
       case 'FLOAT': this.advance(); return N('FloatLit', { value: t.value });
       case 'STRING': this.advance(); return this.makeString(t.value);
       case 'SYMBOL': this.advance(); return N('SymLit', { name: t.value });
+      case 'REGEX': {
+        this.advance();
+        const parts = t.value.parts.map((p) =>
+          'str' in p ? { str: p.str } : { node: parseExpression(p.expr) });
+        return N('RegexLit', { parts, flags: t.value.flags });
+      }
       case 'WORDS': {
         this.advance();
         const elements = t.value.words.map((w) =>

@@ -134,6 +134,12 @@ export class Lexer {
       if (this.isDelim(k)) return this.scanPercentString('Q', 1);
     }
 
+    // Regex literal /pattern/flags (vs division — use value context + spacing).
+    if (c === '/' && (this.prevAllowsValue() ||
+        (this.spaceBefore && this.peek(1) !== ' ' && this.peek(1) !== '=' && this.peek(1) !== undefined))) {
+      return this.scanRegex();
+    }
+
     if (isDigit(c)) return this.scanNumber();
     if (c === '"') return this.scanString('"', true);
     if (c === "'") return this.scanString("'", false);
@@ -350,6 +356,33 @@ export class Lexer {
       this.pos++;
     }
     return out;
+  }
+
+  scanRegex() {
+    this.pos++; // consume opening /
+    const parts = [];
+    let buf = '';
+    let inClass = false;
+    while (this.pos < this.src.length) {
+      const c = this.peek();
+      if (c === '\\') { buf += c + (this.peek(1) ?? ''); this.pos += 2; continue; }
+      if (c === '[') inClass = true;
+      else if (c === ']') inClass = false;
+      else if (c === '/' && !inClass) break;
+      if (c === '#' && this.peek(1) === '{') {
+        if (buf.length) { parts.push({ str: buf }); buf = ''; }
+        this.pos += 2;
+        parts.push({ expr: this.scanInterpolation() });
+        continue;
+      }
+      if (c === '\n') this.line++;
+      buf += c; this.pos++;
+    }
+    this.pos++; // consume closing /
+    let flags = '';
+    while (this.peek() !== undefined && /[imxouesn]/.test(this.peek())) { flags += this.peek(); this.pos++; }
+    if (buf.length || parts.length === 0) parts.push({ str: buf });
+    this.push('REGEX', { parts, flags });
   }
 
   tryHeredoc() {

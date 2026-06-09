@@ -30,8 +30,32 @@ class REnumerator {
   constructor(genFn) { this.genFn = genFn; this._iter = null; }
   *[Symbol.iterator]() { yield* this.genFn(); }
 }
+class RRegexp {
+  constructor(source, flags) {
+    this.source = source;
+    this.rflags = flags || '';
+    const conv = convertRegexSource(source, this.rflags);
+    this.re = new RegExp(conv.src, conv.flags);
+  }
+}
 class RObject {
   constructor(rclass) { this.rclass = rclass; this.ivars = Object.create(null); }
+}
+
+// Translate a Ruby regex source+flags to a JS RegExp.
+function convertRegexSource(source, rflags) {
+  let flags = '';
+  if (rflags.includes('i')) flags += 'i';
+  if (rflags.includes('m')) flags += 's'; // Ruby /m = dot matches newline = JS /s
+  let src = source
+    .replace(/\\A/g, '^').replace(/\\z/g, '$').replace(/\\Z/g, '$')
+    .replace(/\\h/g, '[0-9a-fA-F]').replace(/\\H/g, '[^0-9a-fA-F]');
+  if (rflags.includes('x')) {
+    src = src.replace(/\\?\s|#.*$/gm, (m) => (m[0] === '\\' ? m : ''));
+  }
+  let f = flags + 'd';
+  try { new RegExp(src, f); } catch { f = flags; try { new RegExp(src, f); } catch { src = source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); } }
+  return { src, flags: f };
 }
 class RClass {
   constructor(name, superclass, isModule = false) {
@@ -140,6 +164,8 @@ const MathM = defClass('Math', null, true);
 const EnumeratorC = defClass('Enumerator', ObjectC);
 EnumeratorC.includes.push(EnumerableC);
 const StructC = defClass('Struct', ObjectC);
+const RegexpC = defClass('Regexp', ObjectC);
+const MatchDataC = defClass('MatchData', ObjectC);
 NumericC.includes.push(ComparableC);
 StringC.includes.push(ComparableC);
 ArrayC.includes.push(EnumerableC);
@@ -189,6 +215,7 @@ function classOf(v) {
   if (v instanceof RRange) return RangeC;
   if (v instanceof RProc) return ProcC;
   if (v instanceof REnumerator) return EnumeratorC;
+  if (v instanceof RRegexp) return RegexpC;
   if (v instanceof RClass) return v.isModule ? ModuleC : ClassC;
   if (v instanceof RObject) return v.rclass;
   return ObjectC;
@@ -494,6 +521,8 @@ const R = {
   str: (s) => new RString(s),
   sym: (() => { const tbl = new Map(); return (n) => { let s = tbl.get(n); if (!s) { s = new RSymbol(n); tbl.set(n, s); } return s; }; })(),
   range: (from, to, excl) => new RRange(from, to, excl),
+  regexp: (src, flags) => new RRegexp(src instanceof RString ? src.value : String(src), flags),
+  RRegexp,
   hash: (pairs) => { const h = new RHash(); for (const [k, v] of pairs) h.set(k, v); return h; },
   hashMerge: (h, ...others) => { for (const o of others) { if (o instanceof RHash) for (const [k, v] of o.entries()) h.set(k, v); } return h; },
   array: (a) => a,
@@ -756,6 +785,7 @@ installModuleClass();
 installException();
 installMath();
 installStruct();
+installRegexp();
 
 OBJECT_TO_S = ObjectC.methods.get('to_s');
 OBJECT_INSPECT = ObjectC.methods.get('inspect');
@@ -1084,7 +1114,7 @@ function installString() {
   def(S, 'include?', (s, a) => s.value.includes(jsstr(a[0])));
   def(S, 'start_with?', (s, a) => a.some((x) => s.value.startsWith(jsstr(x))));
   def(S, 'end_with?', (s, a) => a.some((x) => s.value.endsWith(jsstr(x))));
-  def(S, 'index', (s, a) => { const i = s.value.indexOf(jsstr(a[0]), a[1] != null ? numVal(a[1]) : 0); return i < 0 ? null : i; });
+  def(S, 'index', (s, a) => { if (a[0] instanceof RRegexp) { const re = jsRe(a[0], true); re.lastIndex = a[1] != null ? numVal(a[1]) : 0; const m = re.exec(s.value); return m ? m.index : null; } const i = s.value.indexOf(jsstr(a[0]), a[1] != null ? numVal(a[1]) : 0); return i < 0 ? null : i; });
   def(S, 'rindex', (s, a) => { const i = s.value.lastIndexOf(jsstr(a[0])); return i < 0 ? null : i; });
   def(S, 'replace', (s, a) => { s.value = jsstr(a[0]); return s; });
   def(S, 'sub', (s, a, blk) => new RString(strSub(s.value, a, blk, false)));
@@ -1118,10 +1148,10 @@ function installString() {
   def(S, 'frozen?', (s) => !!s.__frozen);
   def(S, 'dup', (s) => new RString(s.value));
   def(S, 'format', (s, a) => new RString(sprintf(s.value, a)));
-  def(S, 'match?', (s, a) => new RegExp(jsstr(a[0])).test(s.value));
-  def(S, 'match', (s, a) => { const m = s.value.match(new RegExp(jsstr(a[0]))); return m ? new RString(m[0]) : null; });
-  def(S, 'scan', (s, a) => { const re = new RegExp(jsstr(a[0]), 'g'); const out = []; let m; while ((m = re.exec(s.value))) { out.push(m.length > 1 ? m.slice(1).map((x) => new RString(x)) : new RString(m[0])); if (m.index === re.lastIndex) re.lastIndex++; } return out; });
-  def(S, '=~', () => null);
+  def(S, 'match?', (s, a) => jsRe(a[0]).test(s.value));
+  def(S, 'match', (s, a, blk) => { const m = s.value.match(jsRe(a[0])); gvars['$~'] = m ? mkMatchData(m, s.value) : null; if (!m) return null; const md = mkMatchData(m, s.value); return blk ? callBlock(blk, [md]) : md; });
+  def(S, 'scan', (s, a, blk) => { const re = jsRe(a[0], true); const out = []; let m; while ((m = re.exec(s.value))) { const item = m.length > 1 ? m.slice(1).map((x) => (x != null ? new RString(x) : null)) : new RString(m[0]); if (blk) callBlock(blk, [item]); else out.push(item); if (m.index === re.lastIndex) re.lastIndex++; } return blk ? s : out; });
+  def(S, '=~', (s, a) => { if (!(a[0] instanceof RRegexp)) return null; const m = s.value.match(jsRe(a[0])); gvars['$~'] = m ? mkMatchData(m, s.value) : null; return m ? m.index : null; });
   def(S, 'each_with_index', (s, a, blk) => { let i = 0; for (const c of s.value) safeYield(blk, [new RString(c), i++]); return s; });
   def(S, 'encoding', (s) => new RString('UTF-8'));
   def(S, 'force_encoding', (s) => s);
@@ -1133,6 +1163,12 @@ function padStr(pad, len) { let out = ''; while (out.length < len) out += pad; r
 function strSplit(str, a) {
   if (a.length === 0 || a[0] === null) return str.trim().split(/\s+/).filter((x) => x.length).map((x) => new RString(x));
   const sep = a[0]; const limit = a[1] != null ? numVal(a[1]) : -1;
+  if (sep instanceof RRegexp) {
+    let parts = str.split(new RegExp(sep.re.source, sep.re.flags.replace('g', '')));
+    if (limit <= 0) { while (parts.length && parts[parts.length - 1] === '') parts.pop(); }
+    return parts.map((p) => new RString(p == null ? '' : p));
+  }
+  if (sep instanceof RString && sep.value === ' ') return str.trim().split(/\s+/).filter((x) => x.length).map((x) => new RString(x));
   if (sep instanceof RString && sep.value === '') return [...str].map((c) => new RString(c));
   const sepStr = jsstr(sep);
   let parts = str.split(sepStr);
@@ -1142,7 +1178,7 @@ function strSplit(str, a) {
 }
 function strSub(str, a, blk, global) {
   const pat = a[0];
-  const re = pat instanceof RString ? new RegExp(escapeRe(pat.value), global ? 'g' : '') : new RegExp(jsstr(pat), global ? 'g' : '');
+  const re = jsRe(pat, global);
   if (blk) return str.replace(re, (m) => toS(callBlock(blk, [new RString(m)])));
   const rep = a[1];
   if (rep instanceof RHash) return str.replace(re, (m) => { const val = rep.get(new RString(m)); return val == null ? '' : toS(val); });
@@ -1751,6 +1787,45 @@ function structInspect(self, members) {
   const name = self.rclass.name ? ' ' + self.rclass.name : '';
   const parts = members.map((m) => `${m}=${inspect(self.ivars['@' + m] ?? null)}`);
   return `#<struct${name} ${parts.join(', ')}>`;
+}
+
+// ---- Regexp / MatchData ---------------------------------------------------
+function jsRe(pat, global) {
+  if (pat instanceof RRegexp) { let f = pat.re.flags; if (global && !f.includes('g')) f += 'g'; return new RegExp(pat.re.source, f); }
+  const s = jsstr(pat);
+  return new RegExp(s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), global ? 'g' : '');
+}
+function mkMatchData(m, str) {
+  const md = new RObject(MatchDataC);
+  md.ivars['@__m'] = m;
+  md.ivars['@__str'] = str;
+  return md;
+}
+function installRegexp() {
+  const RG = RegexpC;
+  sdef(RG, 'new', (cls, a) => new RRegexp(a[0] instanceof RRegexp ? a[0].source : jsstr(a[0]), a[1] != null ? jsstr(a[1]) : ''));
+  sdef(RG, 'escape', (cls, a) => new RString(jsstr(a[0]).replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&')));
+  sdef(RG, 'quote', RG.smethods.get('escape'));
+  def(RG, 'match?', (s, a) => { const str = jsstr(a[0]); return s.re.test(str); });
+  def(RG, 'match', (s, a) => { const str = jsstr(a[0]); const m = str.match(new RegExp(s.re.source, s.re.flags.replace('g', ''))); gvars['$~'] = m ? mkMatchData(m, str) : null; return m ? mkMatchData(m, str) : null; });
+  def(RG, '=~', (s, a) => { if (!(a[0] instanceof RString)) return null; const m = a[0].value.match(new RegExp(s.re.source, s.re.flags.replace('g', ''))); return m ? m.index : null; });
+  def(RG, '===', (s, a) => (a[0] instanceof RString || a[0] instanceof RSymbol) && s.re.test(toS(a[0])));
+  def(RG, 'source', (s) => new RString(s.source));
+  def(RG, 'to_s', (s) => new RString(`(?-mix:${s.source})`));
+  def(RG, 'inspect', (s) => new RString('/' + s.source + '/' + s.rflags.replace(/[^imx]/g, '')));
+  def(RG, '==', (s, a) => a[0] instanceof RRegexp && s.source === a[0].source && s.rflags === a[0].rflags);
+  def(RG, 'names', (s) => { const names = []; const re = /\(\?<([a-zA-Z_]\w*)>/g; let m; while ((m = re.exec(s.source))) names.push(new RString(m[1])); return names; });
+
+  const M = MatchDataC;
+  def(M, '[]', (s, a) => { const m = s.ivars['@__m']; const k = a[0]; if (isInt(k)) return m[k] != null ? new RString(m[k]) : null; const n = k instanceof RSymbol ? k.name : jsstr(k); return m.groups && m.groups[n] != null ? new RString(m.groups[n]) : null; });
+  def(M, 'to_a', (s) => Array.from(s.ivars['@__m']).map((x) => (x != null ? new RString(x) : null)));
+  def(M, 'captures', (s) => Array.from(s.ivars['@__m']).slice(1).map((x) => (x != null ? new RString(x) : null)));
+  def(M, 'named_captures', (s) => { const h = new RHash(); const g = s.ivars['@__m'].groups || {}; for (const k of Object.keys(g)) h.set(new RString(k), g[k] != null ? new RString(g[k]) : null); return h; });
+  def(M, 'pre_match', (s) => new RString(s.ivars['@__str'].slice(0, s.ivars['@__m'].index)));
+  def(M, 'post_match', (s) => new RString(s.ivars['@__str'].slice(s.ivars['@__m'].index + s.ivars['@__m'][0].length)));
+  def(M, 'begin', (s) => s.ivars['@__m'].index);
+  def(M, 'to_s', (s) => new RString(s.ivars['@__m'][0]));
+  def(M, 'size', (s) => s.ivars['@__m'].length);
 }
 
 // ---- Math -----------------------------------------------------------------

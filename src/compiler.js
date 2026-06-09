@@ -126,6 +126,19 @@ function analyze(node, scope) {
       if (node.block) analyzeBlock(node.block, scope);
       return;
     }
+    case 'If': {
+      analyze(node.cond, scope);
+      analyze(node.then, scope);
+      for (const e of node.elifs) { analyze(e.cond, scope); analyze(e.body, scope); }
+      analyze(node.elseBody, scope);
+      return;
+    }
+    case 'Case': {
+      analyze(node.subject, scope);
+      for (const w of node.whens) { analyze(w.conds, scope); analyze(w.body, scope); }
+      analyze(node.elseBody, scope);
+      return;
+    }
     case 'Begin': {
       analyze(node.body, scope);
       for (const r of node.rescues) {
@@ -273,6 +286,7 @@ export class Compiler {
       case 'FloatLit': return `R.float(${node.value})`;
       case 'StrLit': return this.genStr(node);
       case 'SymLit': return `R.sym(${this.q(node.name)})`;
+      case 'RegexLit': return this.genRegex(node);
       case 'NilLit': return 'null';
       case 'BoolLit': return node.value ? 'true' : 'false';
       case 'Self': return '$self';
@@ -320,6 +334,13 @@ export class Compiler {
   }
 
   iife(stmt) { return `(() => { ${stmt} })()`; }
+
+  genRegex(node) {
+    let src;
+    if (node.parts.length === 1 && 'str' in node.parts[0]) src = this.q(node.parts[0].str);
+    else src = node.parts.map((p) => 'str' in p ? this.q(p.str) : `R.interp(${this.gen(p.node)})`).join(' + ');
+    return `R.regexp(${src}, ${this.q(node.flags)})`;
+  }
 
   genStr(node) {
     if (node.parts.length === 1 && 'str' in node.parts[0]) {
