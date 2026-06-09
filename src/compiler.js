@@ -46,7 +46,15 @@ function declareLocal(scope, name) {
 function analyze(node, scope) {
   if (node == null) return;
   if (Array.isArray(node)) { for (const n of node) analyze(n, scope); return; }
-  if (typeof node !== 'object' || !node.type) return;
+  if (typeof node !== 'object') return;
+  if (!node.type) {
+    // untyped container (hash pairs, string/regex parts…): walk its values
+    for (const k of Object.keys(node)) {
+      if (k.startsWith('__')) continue;
+      analyze(node[k], scope);
+    }
+    return;
+  }
 
   switch (node.type) {
     case 'Program': {
@@ -194,7 +202,17 @@ export class Compiler {
     this.classRef = '$cls';
     this.methodName = null;
     this.ctx = []; // 'loop' | 'block'
+    // Current JS expression for Ruby `self`. Method bodies use the `$self`
+    // parameter; blocks/lambdas use a rebindable `$sfN` (so instance_eval /
+    // define_method can rebind self via the block's second argument).
+    this.selfRef = '$self';
+    // Lexical class/module nesting as cumulative "Foo::Bar" paths (outermost
+    // first). Baked into constant lookups so `VERSION` inside `module Foo`
+    // resolves to Foo::VERSION before any global VERSION.
+    this.nesting = [];
   }
+
+  nestingJson() { return JSON.stringify(this.nesting); }
 
   t() { return '$t' + (++this.tmp); }
   q(s) { return JSON.stringify(s); }
@@ -293,15 +311,15 @@ export class Compiler {
       case 'RegexLit': return this.genRegex(node);
       case 'NilLit': return 'null';
       case 'BoolLit': return node.value ? 'true' : 'false';
-      case 'Self': return '$self';
+      case 'Self': return this.selfRef;
       case 'MethodName': return this.methodName ? `R.sym(${this.q(this.methodName)})` : 'null';
       case 'ArrayLit': return this.genArrayLit(node);
       case 'HashLit': return this.genHashLit(node);
       case 'Ident': return this.genIdent(node);
-      case 'IVar': return `R.ivarGet($self, ${this.q(node.name)})`;
+      case 'IVar': return `R.ivarGet(${this.selfRef}, ${this.q(node.name)})`;
       case 'CVar': return `R.cvarGet(${this.classRef}, ${this.q(node.name)})`;
       case 'GVar': return `R.gvarGet(${this.q(node.name)})`;
-      case 'Const': return `R.constGet(${this.q(node.name)})`;
+      case 'Const': return `R.constResolve(${this.nestingJson()}, ${this.classRef}, ${this.q(node.name)})`;
       case 'ConstPath': return `R.constGetFrom(${this.gen(node.base)}, ${this.q(node.name)})`;
       case 'Assign': return this.genAssign(node);
       case 'OpAssign': return this.genOpAssign(node);
@@ -329,7 +347,8 @@ export class Compiler {
       case 'Break': return this.iife(this.genBreak(node));
       case 'Next': return this.iife(this.genNext(node));
       case 'Defined': return this.genDefined(node);
-      case 'Attr': return `R.defineAttr(${this.classRef}, ${this.q(node.kind)}, ${JSON.stringify(node.names)})`;
+      case 'Attr': return `R.defineAttr(R.currentDefinee(), ${this.q(node.kind)}, ${JSON.stringify(node.names)})`;
+      case 'Alias': return `R.send(R.currentDefinee(), "alias_method", [R.sym(${this.q(node.newName)}), R.sym(${this.q(node.oldName)})])`;
       case 'Splat': return `...R.splat(${this.gen(node.value)})`;
       case 'BlockPass': return this.gen(node.value);
       default:
@@ -375,8 +394,10 @@ export class Compiler {
   genIdent(node) {
     if (node.name === 'block_given?') return '($blk !== null && $blk !== undefined)';
     if (node.name === '__method__') return this.methodName ? `R.sym(${this.q(this.methodName)})` : 'null';
+    if (node.name === '__FILE__') return 'R.currentFile()';
+    if (node.name === '__LINE__') return '0';
     if (isVisible(this.scope, node.name)) return this.local(node.name);
-    return `R.send($self, ${this.q(node.name)}, [])`;
+    return `R.send(${this.selfRef}, ${this.q(node.name)}, [])`;
   }
 
   genArgs(args) {
@@ -397,7 +418,7 @@ export class Compiler {
     if (node.receiver === null) {
       if (node.name === 'block_given?') return '($blk !== null && $blk !== undefined)';
     }
-    const recv = node.receiver ? this.gen(node.receiver) : '$self';
+    const recv = node.receiver ? this.gen(node.receiver) : this.selfRef;
     const args = this.genArgs(node.args);
     const block = this.genBlockArg(node);
     const blockArg = block ? `, ${block}` : '';
@@ -432,7 +453,7 @@ export class Compiler {
         declareLocal(this.scope, target.name);
         return `(${this.local(target.name)} = ${vexpr})`;
       }
-      case 'IVar': return `R.ivarSet($self, ${this.q(target.name)}, ${vexpr})`;
+      case 'IVar': return `R.ivarSet(${this.selfRef}, ${this.q(target.name)}, ${vexpr})`;
       case 'GVar': return `R.gvarSet(${this.q(target.name)}, ${vexpr})`;
       case 'CVar': return `R.cvarSet(${this.classRef}, ${this.q(target.name)}, ${vexpr})`;
       case 'Const': return `R.constSet(${this.q(target.name)}, ${vexpr})`;
@@ -452,10 +473,10 @@ export class Compiler {
   readTarget(target) {
     switch (target.type) {
       case 'Ident': return this.local(target.name);
-      case 'IVar': return `R.ivarGet($self, ${this.q(target.name)})`;
+      case 'IVar': return `R.ivarGet(${this.selfRef}, ${this.q(target.name)})`;
       case 'GVar': return `R.gvarGet(${this.q(target.name)})`;
       case 'CVar': return `R.cvarGet(${this.classRef}, ${this.q(target.name)})`;
-      case 'Const': return `R.constGet(${this.q(target.name)})`;
+      case 'Const': return `R.constResolve(${this.nestingJson()}, ${this.classRef}, ${this.q(target.name)})`;
       case 'Index': return `R.send(${this.gen(target.receiver)}, "[]", [${this.genArgs(target.args)}])`;
       case 'Call': return `R.send(${this.gen(target.receiver)}, ${this.q(target.name)}, [])`;
       default: throw new Error('Cannot read target ' + target.type);
@@ -660,21 +681,23 @@ export class Compiler {
     // Capture the defining class at registration time so cvars and `super`
     // inside the method body resolve against it.
     const target = node.singleton
-      ? (node.singleton.type === 'Self' ? '$self' : this.gen(node.singleton))
+      ? (node.singleton.type === 'Self' ? this.selfRef : this.gen(node.singleton))
       : 'R.currentDefinee()';
 
     const prevMethod = this.methodName;
     this.methodName = node.name;
     const scope = node.__scope;
-    const prevScope = this.scope, prevCtx = this.ctx, prevClassRef = this.classRef;
+    const prevScope = this.scope, prevCtx = this.ctx, prevClassRef = this.classRef, prevSelf = this.selfRef;
     this.scope = scope;
     this.ctx = ['method'];
     this.classRef = '$dc';
+    this.selfRef = '$self';
     const bind = this.genParamBinding(node.params, false);
     const body = this.genFnBody(node.body, scope, { wrapReturn: true });
     this.scope = prevScope;
     this.ctx = prevCtx;
     this.classRef = prevClassRef;
+    this.selfRef = prevSelf;
     this.methodName = prevMethod;
     const fn = `function ($self, $args, $blk) {\n${bind}\n${body}\n}`;
     const defFn = node.singleton ? 'defineSMethod' : 'defineMethod';
@@ -684,24 +707,35 @@ export class Compiler {
   genClass(node) {
     const superExpr = node.superclass ? this.gen(node.superclass) : 'null';
     const scope = node.__scope;
-    const prevScope = this.scope, prevClassRef = this.classRef, prevCtx = this.ctx;
-    this.scope = scope; this.classRef = '$cls'; this.ctx = ['method'];
+    const prevScope = this.scope, prevClassRef = this.classRef, prevCtx = this.ctx, prevSelf = this.selfRef;
+    this.scope = scope; this.classRef = '$cls'; this.ctx = ['method']; this.selfRef = '$self';
+    this.nesting.push(this.childPath(node.name));
     const decls = this.declList(scope);
     const body = this.genReturningBody(node.body);
-    this.scope = prevScope; this.classRef = prevClassRef; this.ctx = prevCtx;
+    this.nesting.pop();
+    this.scope = prevScope; this.classRef = prevClassRef; this.ctx = prevCtx; this.selfRef = prevSelf;
     const builder = `function ($cls) {\nconst $self = $cls;\nconst $blk = null;\n${decls}\n${body}\n}`;
     return `R.defineClass(${this.q(node.name)}, ${superExpr}, ${builder}, null)`;
   }
 
   genModule(node) {
     const scope = node.__scope;
-    const prevScope = this.scope, prevClassRef = this.classRef, prevCtx = this.ctx;
-    this.scope = scope; this.classRef = '$cls'; this.ctx = ['method'];
+    const prevScope = this.scope, prevClassRef = this.classRef, prevCtx = this.ctx, prevSelf = this.selfRef;
+    this.scope = scope; this.classRef = '$cls'; this.ctx = ['method']; this.selfRef = '$self';
+    this.nesting.push(this.childPath(node.name));
     const decls = this.declList(scope);
     const body = this.genReturningBody(node.body);
-    this.scope = prevScope; this.classRef = prevClassRef; this.ctx = prevCtx;
+    this.nesting.pop();
+    this.scope = prevScope; this.classRef = prevClassRef; this.ctx = prevCtx; this.selfRef = prevSelf;
     const builder = `function ($cls) {\nconst $self = $cls;\nconst $blk = null;\n${decls}\n${body}\n}`;
     return `R.defineModule(${this.q(node.name)}, ${builder}, null)`;
+  }
+
+  // Cumulative nesting path for a class/module body ("Geometry" + "Circle"
+  // => "Geometry::Circle").
+  childPath(name) {
+    const parent = this.nesting.length ? this.nesting[this.nesting.length - 1] : '';
+    return parent ? parent + '::' + name : name;
   }
 
   genSingletonClass(node) {
@@ -726,36 +760,44 @@ export class Compiler {
   genSingletonMember(node, target) {
     if (node.type === 'Def') {
       const prevMethod = this.methodName; this.methodName = node.name;
-      const scope = node.__scope; const prevScope = this.scope; const prevCtx = this.ctx; const prevClassRef = this.classRef;
-      this.scope = scope; this.ctx = ['method']; this.classRef = '$dc';
+      const scope = node.__scope; const prevScope = this.scope; const prevCtx = this.ctx; const prevClassRef = this.classRef; const prevSelf = this.selfRef;
+      this.scope = scope; this.ctx = ['method']; this.classRef = '$dc'; this.selfRef = '$self';
       const bind = this.genParamBinding(node.params, false);
       const body = this.genFnBody(node.body, scope, { wrapReturn: true });
-      this.scope = prevScope; this.ctx = prevCtx; this.classRef = prevClassRef; this.methodName = prevMethod;
+      this.scope = prevScope; this.ctx = prevCtx; this.classRef = prevClassRef; this.selfRef = prevSelf; this.methodName = prevMethod;
       const fn = `function ($self, $args, $blk) {\n${bind}\n${body}\n}`;
       return `(($dc) => R.defineSMethod($dc, ${this.q(node.name)}, ${fn}))(${target});`;
+    }
+    if (node.type === 'Alias') {
+      return `R.aliasSingleton(${target}, ${this.q(node.newName)}, ${this.q(node.oldName)});`;
+    }
+    if (node.type === 'Attr') {
+      return `R.defineAttr(${target}, ${this.q(node.kind)}, ${JSON.stringify(node.names)});`;
     }
     return this.genStmt(node);
   }
 
   genLambda(node) {
     const scope = node.__scope;
-    const prevScope = this.scope, prevCtx = this.ctx;
-    this.scope = scope; this.ctx = ['lambda'];
+    const prevScope = this.scope, prevCtx = this.ctx, prevSelf = this.selfRef;
+    const sf = '$sf' + (++this.tmp);
+    this.scope = scope; this.ctx = ['lambda']; this.selfRef = sf;
     const bind = this.genParamBinding(node.params, false);
     const body = this.genFnBody(node.body, scope, { wrapReturn: true });
-    this.scope = prevScope; this.ctx = prevCtx;
-    return `R.makeProc(function ($args, $self2) {\n${bind}\n${body}\n}, true)`;
+    this.scope = prevScope; this.ctx = prevCtx; this.selfRef = prevSelf;
+    return `R.makeProc(function ($args, $self2) {\nconst ${sf} = ($self2 == null ? ${prevSelf} : $self2);\n${bind}\n${body}\n}, true)`;
   }
 
   genBlockNode(block) {
     const scope = block.__scope;
-    const prevScope = this.scope, prevCtx = this.ctx;
-    this.scope = scope; this.ctx = [...this.ctx, 'block'];
+    const prevScope = this.scope, prevCtx = this.ctx, prevSelf = this.selfRef;
+    const sf = '$sf' + (++this.tmp);
+    this.scope = scope; this.ctx = [...this.ctx, 'block']; this.selfRef = sf;
     const bind = this.genParamBinding(block.params, true);
     const decls = this.declList(scope);
     const body = this.genReturningBody(block.body);
-    this.scope = prevScope; this.ctx = prevCtx;
-    return `R.makeProc(function ($args, $self2) {\n${bind}\n${decls}\n${body}\n}, false)`;
+    this.scope = prevScope; this.ctx = prevCtx; this.selfRef = prevSelf;
+    return `R.makeProc(function ($args, $self2) {\nconst ${sf} = ($self2 == null ? ${prevSelf} : $self2);\n${bind}\n${decls}\n${body}\n}, false)`;
   }
 
   // ---- parameter binding --------------------------------------------------
@@ -837,28 +879,28 @@ export class Compiler {
 
   // ---- yield / super / defined? ------------------------------------------
   genYield(node) {
-    return `R.callBlock($blk, [${this.genArgs(node.args)}], $self)`;
+    return `R.callBlock($blk, [${this.genArgs(node.args)}])`;
   }
 
   genSuper(node) {
     const block = '$blk';
     if (node.args === null) {
-      return `R.superCall($self, ${this.classRef}, ${this.q(this.methodName)}, $args, ${block})`;
+      return `R.superCall(${this.selfRef}, ${this.classRef}, ${this.q(this.methodName)}, $args, ${block})`;
     }
-    return `R.superCall($self, ${this.classRef}, ${this.q(this.methodName)}, [${this.genArgs(node.args)}], ${block})`;
+    return `R.superCall(${this.selfRef}, ${this.classRef}, ${this.q(this.methodName)}, [${this.genArgs(node.args)}], ${block})`;
   }
 
   genDefined(node) {
     const op = node.operand;
     if (op.type === 'Ident') {
       if (isVisible(this.scope, op.name)) return `R.str("local-variable")`;
-      return `(R.respondTo($self, ${this.q(op.name)}) ? R.str("method") : null)`;
+      return `(R.respondTo(${this.selfRef}, ${this.q(op.name)}) ? R.str("method") : null)`;
     }
-    if (op.type === 'IVar') return `(R.ivarGet($self, ${this.q(op.name)}) !== null ? R.str("instance-variable") : null)`;
+    if (op.type === 'IVar') return `(R.ivarGet(${this.selfRef}, ${this.q(op.name)}) !== null ? R.str("instance-variable") : null)`;
     if (op.type === 'GVar') return `(R.gvarGet(${this.q(op.name)}) !== null ? R.str("global-variable") : null)`;
-    if (op.type === 'Const') return `(R.consts.has(${this.q(op.name)}) ? R.str("constant") : null)`;
+    if (op.type === 'Const') return `(R.constDefined(${this.nestingJson()}, ${this.classRef}, ${this.q(op.name)}) ? R.str("constant") : null)`;
     if (op.type === 'Call') {
-      const recv = op.receiver ? this.gen(op.receiver) : '$self';
+      const recv = op.receiver ? this.gen(op.receiver) : this.selfRef;
       return `(R.respondTo(${recv}, ${this.q(op.name)}) ? R.str("method") : null)`;
     }
     if (op.type === 'NilLit' || op.type === 'Self' || op.type === 'BoolLit') return `R.str("expression")`;

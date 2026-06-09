@@ -35,6 +35,9 @@ export class Parser {
   constructor(tokens) {
     this.toks = tokens;
     this.i = 0;
+    // >0 while parsing paren-less command arguments: a `do…end` block there
+    // belongs to the outer command, not to a bare identifier argument.
+    this.cmdArgDepth = 0;
   }
 
   // ---- token navigation ---------------------------------------------------
@@ -418,7 +421,7 @@ export class Parser {
     if (t.type === 'STRING') return true;
     if (t.type === 'KEYWORD') {
       return ['nil', 'true', 'false', 'self', 'lambda', 'not', 'defined?',
-        '__method__', 'case', 'begin', 'super', 'yield'].includes(t.value);
+        '__method__', 'case', 'begin', 'super', 'yield', 'def'].includes(t.value);
     }
     if (t.type === 'OP') {
       // `foo -1` / `foo *x` / `foo &blk` / `foo :sym` / `foo [1]` / `foo ->{}`
@@ -438,12 +441,17 @@ export class Parser {
     const args = [];
     let blockArg = null;
     const hashPairs = [];
-    while (true) {
-      const r = this.parseOneArg(hashPairs);
-      if (r && r.blockArg) blockArg = r.blockArg;
-      else if (r && r.arg) args.push(r.arg);
-      if (this.atOp(',')) { this.advance(); this.skipNL(); continue; }
-      break;
+    this.cmdArgDepth++;
+    try {
+      while (true) {
+        const r = this.parseOneArg(hashPairs);
+        if (r && r.blockArg) blockArg = r.blockArg;
+        else if (r && r.arg) args.push(r.arg);
+        if (this.atOp(',')) { this.advance(); this.skipNL(); continue; }
+        break;
+      }
+    } finally {
+      this.cmdArgDepth--;
     }
     if (hashPairs.length) args.push(N('HashLit', { pairs: hashPairs }));
     return { args, blockArg };
@@ -459,17 +467,23 @@ export class Parser {
     const args = [];
     let blockArg = null;
     const hashPairs = [];
-    this.skipNL();
-    while (!this.atOp(closing)) {
-      const r = this.parseOneArg(hashPairs);
-      if (r && r.blockArg) blockArg = r.blockArg;
-      else if (r && r.arg) args.push(r.arg);
+    const prevDepth = this.cmdArgDepth;
+    this.cmdArgDepth = 0; // inside brackets, do…end binds normally again
+    try {
       this.skipNL();
-      if (this.atOp(',')) { this.advance(); this.skipNL(); }
-      else break;
+      while (!this.atOp(closing)) {
+        const r = this.parseOneArg(hashPairs);
+        if (r && r.blockArg) blockArg = r.blockArg;
+        else if (r && r.arg) args.push(r.arg);
+        this.skipNL();
+        if (this.atOp(',')) { this.advance(); this.skipNL(); }
+        else break;
+      }
+      this.skipNL();
+      this.expectOp(closing);
+    } finally {
+      this.cmdArgDepth = prevDepth;
     }
-    this.skipNL();
-    this.expectOp(closing);
     if (hashPairs.length) args.push(N('HashLit', { pairs: hashPairs }));
     return { args, blockArg };
   }
@@ -498,18 +512,32 @@ export class Parser {
   parseOptionalBlock() {
     if (this.atOp('{')) {
       this.advance();
-      const params = this.parseBlockParams();
-      const body = this.parseStatements(() => this.atOp('}'));
-      this.expectOp('}');
-      return N('BlockNode', { params, body });
+      const prevDepth = this.cmdArgDepth;
+      this.cmdArgDepth = 0; // fresh statement context inside the block body
+      try {
+        const params = this.parseBlockParams();
+        const body = this.parseStatements(() => this.atOp('}'));
+        this.expectOp('}');
+        return N('BlockNode', { params, body });
+      } finally {
+        this.cmdArgDepth = prevDepth;
+      }
     }
+    // a do…end in command-argument position belongs to the outer command
+    if (this.atKw('do') && this.cmdArgDepth > 0) return null;
     if (this.atKw('do')) {
       this.advance();
-      this.skipNL();
-      const params = this.parseBlockParams();
-      const body = this.parseStatements(() => this.atKw('end'));
-      this.expectKw('end');
-      return N('BlockNode', { params, body });
+      const prevDepth = this.cmdArgDepth;
+      this.cmdArgDepth = 0;
+      try {
+        this.skipNL();
+        const params = this.parseBlockParams();
+        const body = this.parseStatements(() => this.atKw('end'));
+        this.expectKw('end');
+        return N('BlockNode', { params, body });
+      } finally {
+        this.cmdArgDepth = prevDepth;
+      }
     }
     return null;
   }
@@ -771,6 +799,12 @@ export class Parser {
       case 'attr_reader':
       case 'attr_writer':
         return this.parseAttr(v);
+      case 'alias': {
+        this.advance();
+        const newName = this.parseAliasName();
+        const oldName = this.parseAliasName();
+        return N('Alias', { newName, oldName });
+      }
       case 'lambda': {
         this.advance();
         const block = this.parseOptionalBlock();
@@ -779,6 +813,12 @@ export class Parser {
       default:
         this.error(`unexpected keyword '${v}'`);
     }
+  }
+
+  parseAliasName() {
+    if (this.atType('SYMBOL')) return this.advance().value;
+    if (this.atType('GVAR')) return this.advance().value;
+    return this.parseMethodName();
   }
 
   parseAttr(kind) {
@@ -927,9 +967,12 @@ export class Parser {
     const t = this.cur();
     if (t.type === 'IDENT' || t.type === 'CONST') {
       this.advance();
-      let name = t.value;
-      if (this.atOp('=') && !this.cur().spaceBefore && this.peek().type !== 'OP') {
-        // setter def name=(v) — but avoid endless-def `=`; require it to be a setter form
+      const name = t.value;
+      // setter: `def name=(v)` — the `=` hugs the name; an endless method
+      // (`def name = expr`) has a space before `=`.
+      if (this.atOp('=') && !this.cur().spaceBefore) {
+        this.advance();
+        return name + '=';
       }
       return name;
     }
@@ -962,11 +1005,12 @@ export class Parser {
 
   parseModule() {
     this.advance();
-    const name = this.expectType('CONST').value;
+    const path = [this.expectType('CONST').value];
+    while (this.atOp('::')) { this.advance(); path.push(this.expectType('CONST').value); }
     this.skipTerminators();
     const body = this.parseStatements(() => this.atKw('end'));
     this.expectKw('end');
-    return N('Module', { name, body });
+    return N('Module', { name: path.join('::'), body });
   }
 
   parseBegin() {

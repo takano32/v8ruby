@@ -7,7 +7,7 @@ const KEYWORDS = new Set([
   'do', 'class', 'module', 'return', 'yield', 'begin', 'rescue', 'ensure',
   'then', 'case', 'when', 'break', 'next', 'redo', 'retry', 'nil', 'true',
   'false', 'self', 'and', 'or', 'not', 'super', 'defined?', '__method__',
-  'attr_accessor', 'attr_reader', 'attr_writer',
+  'attr_accessor', 'attr_reader', 'attr_writer', 'alias',
 ]);
 
 // Multi-character operators, longest first so we match greedily.
@@ -115,6 +115,13 @@ export class Lexer {
     if (c === '#') {
       while (this.pos < this.src.length && this.peek() !== '\n') this.pos++;
       this.spaceBefore = true;
+      return;
+    }
+
+    // __END__ marker: everything after is DATA, stop lexing.
+    if (c === '_' && this.atLineStart() &&
+        (this.src.startsWith('__END__\n', this.pos) || this.src.slice(this.pos) === '__END__')) {
+      this.pos = this.src.length;
       return;
     }
 
@@ -274,8 +281,7 @@ export class Lexer {
       if (c === '\\') {
         const n = this.peek(1);
         if (interpolate) {
-          buf += this.unescape(n);
-          this.pos += 2;
+          buf += this.scanEscape();
         } else {
           // single-quoted: only \\ and \' are special
           if (n === '\\' || n === quote) {
@@ -306,6 +312,48 @@ export class Lexer {
     this.pos++; // consume closing quote
     if (buf.length || parts.length === 0) parts.push({ str: buf });
     this.push('STRING', parts);
+  }
+
+  // Consume a backslash escape starting at this.pos (which points at `\`),
+  // advancing past it; returns the decoded characters. Handles multi-char
+  // forms: \xNN, \uXXXX, \u{...}, and octal \NNN.
+  scanEscape() {
+    const n = this.peek(1);
+    if (n === 'x') {
+      let hex = '';
+      let i = 2;
+      while (hex.length < 2 && /[0-9a-fA-F]/.test(this.peek(i) ?? '')) { hex += this.peek(i); i++; }
+      if (hex.length) { this.pos += i; return String.fromCharCode(parseInt(hex, 16)); }
+      this.pos += 2; return 'x';
+    }
+    if (n === 'u') {
+      if (this.peek(2) === '{') {
+        let j = 3; let out = ''; let cur = '';
+        while (this.peek(j) !== undefined && this.peek(j) !== '}') {
+          const ch = this.peek(j);
+          if (ch === ' ') { if (cur) { out += String.fromCodePoint(parseInt(cur, 16)); cur = ''; } }
+          else cur += ch;
+          j++;
+        }
+        if (cur) out += String.fromCodePoint(parseInt(cur, 16));
+        this.pos += j + 1;
+        return out;
+      }
+      let hex = '';
+      let i = 2;
+      while (hex.length < 4 && /[0-9a-fA-F]/.test(this.peek(i) ?? '')) { hex += this.peek(i); i++; }
+      if (hex.length === 4) { this.pos += i; return String.fromCodePoint(parseInt(hex, 16)); }
+      this.pos += 2; return 'u';
+    }
+    if (n >= '0' && n <= '7') {
+      let oct = '';
+      let i = 1;
+      while (oct.length < 3 && (this.peek(i) ?? '') >= '0' && (this.peek(i) ?? '') <= '7') { oct += this.peek(i); i++; }
+      this.pos += i;
+      return String.fromCharCode(parseInt(oct, 8));
+    }
+    this.pos += 2;
+    return this.unescape(n);
   }
 
   unescape(n) {

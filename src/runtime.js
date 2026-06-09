@@ -1,6 +1,10 @@
 // Runtime: the Ruby object model and core-class method tables, implemented in
 // JavaScript and executed by V8. Compiled Ruby code calls into the single
 // exported `R` object (R.send, R.truthy, R.str, …).
+
+import * as fs from 'node:fs';
+import * as nodePath from 'node:path';
+import { homedir } from 'node:os';
 //
 // Value representation:
 //   nil     -> JS null
@@ -49,7 +53,8 @@ function convertRegexSource(source, rflags) {
   if (rflags.includes('m')) flags += 's'; // Ruby /m = dot matches newline = JS /s
   let src = source
     .replace(/\\A/g, '^').replace(/\\z/g, '$').replace(/\\Z/g, '$')
-    .replace(/\\h/g, '[0-9a-fA-F]').replace(/\\H/g, '[^0-9a-fA-F]');
+    .replace(/\\h/g, '[0-9a-fA-F]').replace(/\\H/g, '[^0-9a-fA-F]')
+    .replace(/\\e/g, '\\x1b'); // JS regexes have no \e escape
   if (rflags.includes('x')) {
     src = src.replace(/\\?\s|#.*$/gm, (m) => (m[0] === '\\' ? m : ''));
   }
@@ -133,6 +138,13 @@ function objectId(o) {
 // ---- class registry -------------------------------------------------------
 const consts = new Map();          // global constants (class names, top-level consts)
 const gvars = Object.create(null); // global variables
+const GVAR_ALIAS = {
+  '$:': '$LOAD_PATH', '$-I': '$LOAD_PATH',
+  '$"': '$LOADED_FEATURES',
+  '$0': '$PROGRAM_NAME',
+};
+// Registered autoloads: const name -> feature path; triggered on first lookup.
+const autoloads = new Map();
 
 function defClass(name, superclass, isModule = false) {
   const c = new RClass(name, superclass, isModule);
@@ -176,6 +188,9 @@ RangeC.includes.push(EnumerableC);
 
 // Exception hierarchy.
 const ExceptionC = defClass('Exception', ObjectC);
+const ScriptErrorC = defClass('ScriptError', ExceptionC);
+const LoadErrorC = defClass('LoadError', ScriptErrorC);
+const SyntaxErrorC = defClass('SyntaxError', ScriptErrorC);
 const StandardErrorC = defClass('StandardError', ExceptionC);
 const RuntimeErrorC = defClass('RuntimeError', StandardErrorC);
 const ArgumentErrorC = defClass('ArgumentError', StandardErrorC);
@@ -187,7 +202,7 @@ const KeyErrorC = defClass('KeyError', IndexErrorC);
 const RangeErrorC = defClass('RangeError', StandardErrorC);
 const ZeroDivisionErrorC = defClass('ZeroDivisionError', StandardErrorC);
 const StopIterationC = defClass('StopIteration', IndexErrorC);
-const NotImplementedErrorC = defClass('NotImplementedError', StandardErrorC);
+const NotImplementedErrorC = defClass('NotImplementedError', ScriptErrorC);
 const IOErrorC = defClass('IOError', StandardErrorC);
 const FrozenErrorC = defClass('FrozenError', RuntimeErrorC);
 const NoMatchingPatternErrorC = defClass('NoMatchingPatternError', StandardErrorC);
@@ -210,10 +225,10 @@ function classOf(v) {
   const t = typeof v;
   if (t === 'number') return IntegerC;
   if (v instanceof RFloat) return FloatC;
-  if (v instanceof RString) return StringC;
+  if (v instanceof RString) return v.rclass || StringC; // String subclasses
   if (v instanceof RSymbol) return SymbolC;
-  if (Array.isArray(v)) return ArrayC;
-  if (v instanceof RHash) return HashC;
+  if (Array.isArray(v)) return v.rclass || ArrayC;      // Array subclasses
+  if (v instanceof RHash) return v.rclass || HashC;     // Hash subclasses
   if (v instanceof RRange) return RangeC;
   if (v instanceof RProc) return ProcC;
   if (v instanceof REnumerator) return EnumeratorC;
@@ -260,11 +275,32 @@ function send(recv, name, args = [], block = null) {
   if (recv instanceof RClass) {
     const sm = findSingletonMethod(recv, name);
     if (sm) return sm(recv, args, block);
+    // `extend`ed modules: their instance methods act as singleton methods
+    let c = recv;
+    while (c) {
+      if (c.ext) {
+        for (let i = c.ext.length - 1; i >= 0; i--) {
+          const em = findInModule(c.ext[i], name);
+          if (em) return em(recv, args, block);
+        }
+      }
+      c = c.superclass;
+    }
     if (name === 'new') return classNew(recv, args, block);
     // module functions live in smethods too; fall through to Module/Class methods
     const m = findMethod(classOf(recv), name);
     if (m) return m(recv, args, block);
     return methodMissing(recv, name, args, block);
+  }
+  // per-object singleton methods and extended modules
+  if (recv instanceof RObject) {
+    if (recv.smeth && recv.smeth.has(name)) return recv.smeth.get(name)(recv, args, block);
+    if (recv.ext) {
+      for (let i = recv.ext.length - 1; i >= 0; i--) {
+        const em = findInModule(recv.ext[i], name);
+        if (em) return em(recv, args, block);
+      }
+    }
   }
   const m = findMethod(classOf(recv), name);
   if (m) return m(recv, args, block);
@@ -288,10 +324,18 @@ function classNew(cls, args, block) {
 
 function respondTo(recv, name) {
   if (recv instanceof RClass) {
-    return !!findSingletonMethod(recv, name) || name === 'new' || !!findMethod(classOf(recv), name);
+    if (findSingletonMethod(recv, name) || name === 'new' || findMethod(classOf(recv), name)) return true;
+    let c = recv;
+    while (c) { if (c.ext && c.ext.some((m) => findInModule(m, name))) return true; c = c.superclass; }
+    return false;
   }
-  return !!findMethod(classOf(recv), name);
+  if (recv instanceof RObject && recv.ext && recv.ext.some((m) => findInModule(m, name))) return true;
+  if (findMethod(classOf(recv), name)) return true;
+  const rtm = findMethod(classOf(recv), 'respond_to_missing?');
+  if (rtm && rtm !== DEFAULT_RTM) return truthy(rtm(recv, [new RSymbol(name), false]));
+  return false;
 }
+let DEFAULT_RTM = null; // captured after Kernel install
 
 // ---- block / proc helpers -------------------------------------------------
 function makeProc(fn, isLambda) { return new RProc(fn, isLambda); }
@@ -549,14 +593,27 @@ const R = {
   // variable helpers
   ivarGet: (self, name) => (self instanceof RObject || self instanceof RClass ? (self.ivars[name] ?? null) : null),
   ivarSet: (self, name, v) => { if (self instanceof RObject || self instanceof RClass) self.ivars[name] = v; return v; },
-  gvarGet: (name) => (gvars[name] ?? null),
-  gvarSet: (name, v) => { gvars[name] = v; return v; },
+  gvarGet: (name) => {
+    name = GVAR_ALIAS[name] || name;
+    if (name.length === 2 && name[1] >= '1' && name[1] <= '9') {
+      const md = gvars['$~'];
+      return md ? send(md, '[]', [+name[1]]) : null;
+    }
+    return gvars[name] ?? null;
+  },
+  gvarSet: (name, v) => { gvars[GVAR_ALIAS[name] || name] = v; return v; },
   cvarGet, cvarSet,
-  constGet, constSet, constGetFrom,
+  constGet, constSet, constGetFrom, constLookup, constResolve, constDefined,
+  autoloads,
+
+  // loader hooks (set by src/loader.js)
+  __require: null,
+  __atexit: [],
+  currentFile: () => new RString('(eval)'),
 
   // class building (used by compiled class/module/def)
   defineClass, defineModule, defineMethod, defineSMethod, includeModule,
-  defineAttr, openSingleton,
+  defineAttr, openSingleton, aliasSingleton,
   currentDefinee, pushDefinee, popDefinee,
 
   // operators that need centralizing
@@ -606,6 +663,8 @@ function superCall(self, cls, name, args, block) {
   if (self instanceof RClass && cls) {
     const sm = cls.superclass ? findSingletonMethod(cls.superclass, name) : null;
     if (sm) return sm(self, args, block);
+    // `def self.new ... super` bottoms out at the default allocator
+    if (name === 'new') return classNew(self, args, block);
   }
   const start = cls ? cls.superclass : (classOf(self).superclass);
   const m = start ? findMethod(start, name) : null;
@@ -648,23 +707,101 @@ function cvarSet(self, name, v) {
   return v;
 }
 
+function tryAutoload(name) {
+  if (!autoloads.has(name) || !R.__require) return false;
+  const path = autoloads.get(name);
+  autoloads.delete(name);
+  try { R.__require(jsstr(path)); } catch (e) { autoloads.set(name, path); throw e; }
+  return true;
+}
+
 function constGet(name) {
   if (consts.has(name)) return consts.get(name);
+  if (tryAutoload(name) && consts.has(name)) return consts.get(name);
   raiseError(NameErrorC, `uninitialized constant ${name}`);
 }
-function constSet(name, v) { consts.set(name, v); if (v instanceof RClass && (v.name === null || v.name === undefined)) v.name = name; return v; }
+function constSet(name, v) {
+  const d = currentDefinee();
+  if (d && d !== ObjectC) d.constants.set(name, v);
+  else consts.set(name, v);
+  if (v instanceof RClass && (v.name === null || v.name === undefined)) v.name = name;
+  return v;
+}
+// Resolve a "Foo::Bar" path from the global root; null if any segment missing.
+function resolvePath(path) {
+  let cur = null;
+  for (const seg of path.split('::')) {
+    const tbl = cur === null ? consts : (cur instanceof RClass ? cur.constants : null);
+    if (!tbl || !tbl.has(seg)) return null;
+    cur = tbl.get(seg);
+  }
+  return cur instanceof RClass ? cur : null;
+}
+// Bare-constant lookup: lexical nesting (innermost first, as compile-time
+// "Foo::Bar" paths), then the defining class's superclass chain, then globals,
+// then autoload.
+function constResolve(nesting, cls, name) {
+  for (let i = nesting.length - 1; i >= 0; i--) {
+    const mod = resolvePath(nesting[i]);
+    if (mod && mod.constants.has(name)) return mod.constants.get(name);
+  }
+  let c = cls instanceof RClass ? cls : null;
+  while (c) {
+    if (c.constants.has(name)) return c.constants.get(name);
+    c = c.superclass;
+  }
+  return constGet(name);
+}
+// Back-compat single-arg form used by a few runtime call sites.
+function constLookup(cls, name) {
+  return constResolve([], cls, name);
+}
+function constDefined(nesting, cls, name) {
+  for (let i = nesting.length - 1; i >= 0; i--) {
+    const mod = resolvePath(nesting[i]);
+    if (mod && mod.constants.has(name)) return true;
+  }
+  let c = cls instanceof RClass ? cls : null;
+  while (c) {
+    if (c.constants.has(name)) return true;
+    c = c.superclass;
+  }
+  return consts.has(name) || autoloads.has(name);
+}
 function constGetFrom(base, name) {
-  if (base instanceof RClass && base.constants.has(name)) return base.constants.get(name);
+  let c = base instanceof RClass ? base : null;
+  while (c) {
+    if (c.constants.has(name)) return c.constants.get(name);
+    c = c.superclass;
+  }
   if (consts.has(name)) return consts.get(name);
-  raiseError(NameErrorC, `uninitialized constant ${name}`);
+  if (tryAutoload(name) && consts.has(name)) return consts.get(name);
+  raiseError(NameErrorC, `uninitialized constant ${base instanceof RClass && base.name ? base.name + '::' : ''}${name}`);
+}
+
+// `class A::B` / `module A::B`: resolve the qualified prefix as the outer scope.
+function splitQualified(name, outer) {
+  if (!name.includes('::')) return [name, outer];
+  const parts = name.split('::');
+  const last = parts.pop();
+  let base = null;
+  for (const p of parts) base = base ? constGetFrom(base, p) : constGet(p);
+  return [last, base];
 }
 
 function defineClass(name, superExpr, builder, outer) {
-  let cls = consts.has(name) ? consts.get(name) : (outer && outer.constants.has(name) ? outer.constants.get(name) : null);
+  [name, outer] = splitQualified(name, outer);
+  if (!outer) { const d = currentDefinee(); if (d && d !== ObjectC) outer = d; }
+  let cls = (outer && outer.constants.has(name)) ? outer.constants.get(name)
+    : (consts.has(name) ? consts.get(name) : null);
   if (!cls) {
     cls = new RClass(name, superExpr || ObjectC);
-    consts.set(name, cls);
-    if (outer) outer.constants.set(name, cls);
+    if (outer) {
+      outer.constants.set(name, cls);
+      if (outer.name) cls.name = outer.name + '::' + name;
+    } else {
+      consts.set(name, cls);
+    }
     if (superExpr) {
       const inh = findSingletonMethod(superExpr, 'inherited');
       if (inh) inh(superExpr, [cls]);
@@ -676,13 +813,41 @@ function defineClass(name, superExpr, builder, outer) {
   return r === undefined ? null : r;
 }
 function defineModule(name, builder, outer) {
-  let mod = consts.has(name) ? consts.get(name) : null;
-  if (!mod) { mod = new RClass(name, null, true); consts.set(name, mod); if (outer) outer.constants.set(name, mod); }
+  [name, outer] = splitQualified(name, outer);
+  if (!outer) { const d = currentDefinee(); if (d && d !== ObjectC) outer = d; }
+  let mod = (outer && outer.constants.has(name)) ? outer.constants.get(name)
+    : (consts.has(name) ? consts.get(name) : null);
+  if (!mod) {
+    mod = new RClass(name, null, true);
+    if (outer) {
+      outer.constants.set(name, mod);
+      if (outer.name) mod.name = outer.name + '::' + name;
+    } else {
+      consts.set(name, mod);
+    }
+  }
   pushDefinee(mod);
   try { builder(mod); } finally { popDefinee(); }
   return null;
 }
-function defineMethod(cls, name, fn) { cls.methods.set(name, fn); return new RSymbol(name); }
+function aliasSingleton(target, newName, oldName) {
+  if (target instanceof RClass) {
+    const m = findSingletonMethod(target, oldName) ||
+      (target.ext || []).map((mod) => findInModule(mod, oldName)).find(Boolean) ||
+      target.methods.get(oldName);
+    if (m) target.smethods.set(newName, m);
+  }
+  return null;
+}
+
+function defineMethod(cls, name, fn) {
+  cls.methods.set(name, fn);
+  // after a bare `module_function`, defs also become module functions
+  if (cls.__modfunc) cls.smethods.set(name, fn);
+  const hook = findSingletonMethod(cls, 'method_added');
+  if (hook) hook(cls, [new RSymbol(name)]);
+  return new RSymbol(name);
+}
 function defineSMethod(cls, name, fn) { cls.smethods.set(name, fn); return new RSymbol(name); }
 function includeModule(cls, mod) { if (!cls.includes.includes(mod)) cls.includes.push(mod); const inc = findSingletonMethod(mod, 'included'); if (inc) inc(mod, [cls]); return cls; }
 function openSingleton(obj, builder) {
@@ -788,11 +953,13 @@ installException();
 installMath();
 installStruct();
 installRegexp();
+installNodeCore();
 
 OBJECT_TO_S = ObjectC.methods.get('to_s');
 OBJECT_INSPECT = ObjectC.methods.get('inspect');
 OBJECT_EQ = ObjectC.methods.get('==');
 OBJECT_METHOD_MISSING = ObjectC.methods.get('method_missing');
+DEFAULT_RTM = ObjectC.methods.get('respond_to_missing?');
 
 // ---- Kernel / Object ------------------------------------------------------
 function installKernel() {
@@ -809,7 +976,7 @@ function installKernel() {
   def(ObjectC, 'raise', (self, args) => rbRaise(args[0], args[1]));
   def(ObjectC, 'fail', (self, args) => rbRaise(args[0], args[1]));
   def(ObjectC, 'loop', (self, args, block) => {
-    try { while (true) { try { callBlock(block, [], self); } catch (e) { if (e instanceof NextError) continue; throw e; } } }
+    try { while (true) { try { callBlock(block, []); } catch (e) { if (e instanceof NextError) continue; throw e; } } }
     catch (e) {
       if (e instanceof BreakError) return e.value;
       if (e instanceof RubyError && isA(e.rubyObj, StopIterationC)) return null;
@@ -859,8 +1026,8 @@ function installKernel() {
   });
   def(ObjectC, 'dup', (self) => dupValue(self));
   def(ObjectC, 'clone', (self) => dupValue(self));
-  def(ObjectC, 'tap', (self, args, block) => { callBlock(block, [self], self); return self; });
-  def(ObjectC, 'then', (self, args, block) => (block ? callBlock(block, [self], self) : self));
+  def(ObjectC, 'tap', (self, args, block) => { callBlock(block, [self]); return self; });
+  def(ObjectC, 'then', (self, args, block) => (block ? callBlock(block, [self]) : self));
   def(ObjectC, 'yield_self', ObjectC.methods.get('then'));
   def(ObjectC, 'itself', (self) => self);
   def(ObjectC, 'object_id', (self) => objectId(self));
@@ -890,6 +1057,53 @@ function installKernel() {
   def(ObjectC, 'instance_variable_defined?', (self, args) => (self.ivars ? ivName(args[0]) in self.ivars : false));
   def(ObjectC, 'instance_variables', (self) => (self.ivars ? Object.keys(self.ivars).map((k) => new RSymbol(k)) : []));
   def(ObjectC, 'method_missing', (self, args) => { raiseError(NoMethodErrorC, `undefined method '${args[0] instanceof RSymbol ? args[0].name : toS(args[0])}' for ${shortInspect(self)}`); });
+  def(ObjectC, 'respond_to_missing?', () => false);
+  def(ObjectC, 'extend', (self, args) => {
+    for (const mod of args) {
+      if (!(mod instanceof RClass)) raiseError(TypeErrorC, 'wrong argument type (expected Module)');
+      if (self instanceof RObject || self instanceof RClass) {
+        if (!self.ext) self.ext = [];
+        if (!self.ext.includes(mod)) self.ext.push(mod);
+        const hook = findSingletonMethod(mod, 'extended');
+        if (hook) hook(mod, [self]);
+      }
+    }
+    return self;
+  });
+  def(ObjectC, '!~', (self, args) => !truthy(send(self, '=~', [args[0]])));
+  def(ObjectC, 'define_singleton_method', (self, args, blk) => {
+    const n = args[0] instanceof RSymbol ? args[0].name : jsstr(args[0]);
+    const body = blk || args[1];
+    const fn = (recv, a, b) => body.fn([...a], recv);
+    if (self instanceof RClass) self.smethods.set(n, fn);
+    else if (self instanceof RObject) { if (!self.smeth) self.smeth = new Map(); self.smeth.set(n, fn); }
+    return new RSymbol(n);
+  });
+  def(ObjectC, 'singleton_methods', (self) => {
+    const out = new Set();
+    if (self instanceof RClass) { let c = self; while (c) { for (const k of c.smethods.keys()) out.add(k); c = c.superclass; } }
+    else if (self instanceof RObject && self.smeth) for (const k of self.smeth.keys()) out.add(k);
+    return [...out].map((n) => new RSymbol(n));
+  });
+  def(ObjectC, 'public_methods', (self) => {
+    const out = new Set();
+    if (self instanceof RClass) {
+      let c = self;
+      while (c) {
+        for (const k of c.smethods.keys()) out.add(k);
+        if (c.ext) for (const m of c.ext) { let mm = m; for (const k of mm.methods.keys()) out.add(k); }
+        c = c.superclass;
+      }
+    }
+    if (self instanceof RObject && self.smeth) for (const k of self.smeth.keys()) out.add(k);
+    let c = classOf(self);
+    while (c) {
+      for (const k of c.methods.keys()) out.add(k);
+      for (const m of c.includes) for (const k of m.methods.keys()) out.add(k);
+      c = c.superclass;
+    }
+    return [...out].map((n) => new RSymbol(n));
+  });
   def(ObjectC, 'instance_of?', (self, args) => classOf(self) === args[0]);
   def(ObjectC, 'methods', (self) => { const out = new Set(); let c = classOf(self); while (c) { for (const k of c.methods.keys()) out.add(k); for (const m of c.includes) for (const k of m.methods.keys()) out.add(k); c = c.superclass; } return [...out].map((n) => new RSymbol(n)); });
   def(ObjectC, 'enum_for', (self, args) => self);
@@ -918,10 +1132,10 @@ function putsImpl(args) {
 }
 
 function dupValue(self) {
-  if (self instanceof RString) return new RString(self.value);
-  if (Array.isArray(self)) return self.slice();
-  if (self instanceof RHash) { const h = new RHash(); for (const [k, v] of self.entries()) h.set(k, v); return h; }
-  if (self instanceof RObject) { const o = new RObject(self.rclass); Object.assign(o.ivars, self.ivars); return o; }
+  if (self instanceof RString) { const s = new RString(self.value); if (self.rclass) s.rclass = self.rclass; return s; }
+  if (Array.isArray(self)) { const a = self.slice(); if (self.rclass) a.rclass = self.rclass; return a; }
+  if (self instanceof RHash) { const h = new RHash(); for (const [k, v] of self.entries()) h.set(k, v); if (self.rclass) h.rclass = self.rclass; return h; }
+  if (self instanceof RObject) { const o = new RObject(self.rclass); Object.assign(o.ivars, self.ivars); if (self.ext) o.ext = [...self.ext]; return o; }
   return self;
 }
 
@@ -1081,7 +1295,15 @@ function installNumeric() {
 function installString() {
   const S = StringC;
   const v = (s) => s.value;
-  sdef(S, 'new', (cls, a) => new RString(a[0] != null ? jsstr(a[0]) : ''));
+  // Base initialize so String subclasses can `super(str)`.
+  def(S, 'initialize', (s, a) => { s.value = a[0] != null ? jsstr(a[0]) : ''; return null; });
+  sdef(S, 'new', (cls, a, blk) => {
+    const s = new RString('');
+    if (cls !== StringC && cls instanceof RClass) s.rclass = cls;
+    const init = findMethod(cls instanceof RClass ? cls : StringC, 'initialize');
+    init(s, a, blk);
+    return s;
+  });
   def(S, '+', (s, a) => { if (!(a[0] instanceof RString)) raiseError(TypeErrorC, `no implicit conversion of ${classOf(a[0]).name} into String`); return new RString(s.value + a[0].value); });
   def(S, '*', (s, a) => new RString(s.value.repeat(numVal(a[0]))));
   def(S, '<<', (s, a) => { s.value += (typeof a[0] === 'number' ? String.fromCharCode(a[0]) : toS(a[0])); return s; });
@@ -1267,7 +1489,14 @@ function installSymbol() {
 function installArray() {
   const A = ArrayC;
   const yieldEach = (arr, blk, fn) => { try { for (let i = 0; i < arr.length; i++) fn(i); } catch (e) { return brk(e); } };
-  sdef(A, 'new', (cls, a, blk) => { const n = a[0] != null ? numVal(a[0]) : 0; const out = []; for (let i = 0; i < n; i++) out.push(blk ? callBlock(blk, [i]) : (a[1] !== undefined ? a[1] : null)); return out; });
+  def(A, 'initialize', (s, a, blk) => { const n = a[0] != null ? numVal(a[0]) : 0; s.length = 0; for (let i = 0; i < n; i++) s.push(blk ? callBlock(blk, [i]) : (a[1] !== undefined ? a[1] : null)); return null; });
+  sdef(A, 'new', (cls, a, blk) => {
+    const out = [];
+    if (cls !== ArrayC && cls instanceof RClass) out.rclass = cls;
+    const init = findMethod(cls instanceof RClass ? cls : ArrayC, 'initialize');
+    init(out, a, blk);
+    return out;
+  });
   sdef(A, '[]', (cls, a) => a.slice());
   def(A, '<<', (s, a) => { s.push(a[0]); return s; });
   def(A, 'push', (s, a) => { for (const x of a) s.push(x); return s; });
@@ -1433,7 +1662,14 @@ function combinations(arr, k) { if (k === 0) return [[]]; if (k > arr.length) re
 // ---- Hash -----------------------------------------------------------------
 function installHash() {
   const H = HashC;
-  sdef(H, 'new', (cls, a, blk) => { const h = new RHash(); if (blk) h.defaultProc = blk; else if (a.length) h.defaultValue = a[0]; return h; });
+  def(H, 'initialize', (s, a, blk) => { if (blk) s.defaultProc = blk; else if (a.length) s.defaultValue = a[0]; return null; });
+  sdef(H, 'new', (cls, a, blk) => {
+    const h = new RHash();
+    if (cls !== HashC && cls instanceof RClass) h.rclass = cls;
+    const init = findMethod(cls instanceof RClass ? cls : HashC, 'initialize');
+    init(h, a, blk);
+    return h;
+  });
   sdef(H, '[]', (cls, a) => { const h = new RHash(); if (a.length === 1 && a[0] instanceof RHash) { for (const [k, v] of a[0].entries()) h.set(k, v); } else if (a.length === 1 && Array.isArray(a[0])) { for (const pair of a[0]) h.set(pair[0], pair[1]); } else { for (let i = 0; i + 1 < a.length; i += 2) h.set(a[i], a[i + 1]); } return h; });
   def(H, '[]', (s, a) => { const e = s.map.get(hashKey(a[0])); if (e) return e.value; if (s.defaultProc) return callBlock(s.defaultProc, [s, a[0]]); return s.defaultValue; });
   def(H, '[]=', (s, a) => { s.set(a[0], a[1]); return a[1]; });
@@ -1590,10 +1826,10 @@ function installProc() {
 }
 function callProc(s, a, blk) {
   if (s.isLambda) {
-    try { return s.fn(a, null); }
+    try { return s.fn(a, undefined); }
     catch (e) { if (e instanceof ReturnError) return e.value; if (e instanceof NextError) return e.value; throw e; }
   }
-  return s.fn(a, null);
+  return s.fn(a, undefined);
 }
 
 // ---- nil / true / false ---------------------------------------------------
@@ -1719,7 +1955,27 @@ function installModuleClass() {
   def(ModuleC, 'class_exec', ModuleC.methods.get('class_eval'));
   def(ObjectC, 'instance_eval', (s, a, blk) => { pushDefinee(classOf(s)); try { return blk ? callBlock(blk, [s], s) : null; } finally { popDefinee(); } });
   def(ObjectC, 'instance_exec', (s, a, blk) => (blk ? callBlock(blk, a, s) : null));
-  def(ModuleC, 'module_function', (s) => s);
+  def(ModuleC, 'module_function', (s, a) => {
+    if (a.length === 0) { s.__modfunc = true; return s; }
+    for (const x of a) {
+      const n = x instanceof RSymbol ? x.name : jsstr(x);
+      const m = findMethod(s, n);
+      if (m) s.smethods.set(n, m);
+    }
+    return a[a.length - 1];
+  });
+  def(ModuleC, 'remove_method', (s, a) => { for (const x of a) s.methods.delete(x instanceof RSymbol ? x.name : jsstr(x)); return s; });
+  def(ModuleC, 'undef_method', (s, a) => { for (const x of a) s.methods.set(x instanceof RSymbol ? x.name : jsstr(x), (self) => { raiseError(NoMethodErrorC, `undefined method '${x instanceof RSymbol ? x.name : jsstr(x)}'`); }); return s; });
+  def(ModuleC, '<', (s, a) => { if (s === a[0]) return false; let c = s; while (c) { if (c === a[0] || c.includes.includes(a[0])) return true; c = c.superclass; } return false; });
+  def(ModuleC, '<=', (s, a) => s === a[0] || truthy(send(s, '<', [a[0]])));
+  def(ModuleC, '>', (s, a) => a[0] instanceof RClass && truthy(send(a[0], '<', [s])));
+  def(ModuleC, '>=', (s, a) => s === a[0] || truthy(send(s, '>', [a[0]])));
+  def(ModuleC, 'autoload', (s, a) => { autoloads.set(a[0] instanceof RSymbol ? a[0].name : jsstr(a[0]), a[1]); return null; });
+  def(ModuleC, 'private_class_method', (s) => s);
+  def(ModuleC, 'public_class_method', (s) => s);
+  def(ModuleC, 'extended', () => null);
+  def(ModuleC, 'instance_variable_get', (s, a) => (s.ivars[ivName(a[0])] ?? null));
+  def(ModuleC, 'instance_variable_set', (s, a) => { s.ivars[ivName(a[0])] = a[1]; return a[1]; });
   def(ModuleC, 'private', (s, a) => (a.length ? a[0] : null));
   def(ModuleC, 'protected', (s, a) => (a.length ? a[0] : null));
   def(ModuleC, 'public', (s, a) => (a.length ? a[0] : null));
@@ -1838,6 +2094,355 @@ function installRegexp() {
   def(M, 'begin', (s) => s.ivars['@__m'].index);
   def(M, 'to_s', (s) => new RString(s.ivars['@__m'][0]));
   def(M, 'size', (s) => s.ivars['@__m'].length);
+}
+
+// ---- Node-backed core: File, Dir, IO, Time, Process, Thread, Data ---------
+function installNodeCore() {
+  const symstr = (x) => (x instanceof RSymbol ? x.name : jsstr(x));
+
+  // ---- IO / STDOUT / STDERR ----
+  const IOC = defClass('IO', ObjectC);
+  const mkIO = (stream, fd) => { const o = new RObject(IOC); o.ivars['@__stream'] = stream; o.ivars['@__fd'] = fd; return o; };
+  const streamOf = (io) => io.ivars['@__stream'];
+  def(IOC, 'write', (s, a) => { let n = 0; for (const x of a) { const t = toS(x); n += t.length; streamOf(s).write(t); } return n; });
+  def(IOC, '<<', (s, a) => { streamOf(s).write(toS(a[0])); return s; });
+  def(IOC, 'print', (s, a) => { for (const x of a) streamOf(s).write(toS(x)); return null; });
+  def(IOC, 'puts', (s, a) => { putsTo(streamOf(s), a); return null; });
+  def(IOC, 'printf', (s, a) => { streamOf(s).write(sprintf(jsstr(a[0]), a.slice(1))); return null; });
+  def(IOC, 'flush', (s) => s);
+  def(IOC, 'sync', () => true);
+  def(IOC, 'sync=', (s, a) => a[0]);
+  def(IOC, 'fileno', (s) => s.ivars['@__fd']);
+  def(IOC, 'tty?', (s) => !!streamOf(s).isTTY);
+  def(IOC, 'isatty', IOC.methods.get('tty?'));
+  def(IOC, 'close', () => null);
+  def(IOC, 'gets', () => null);
+  const stdout = mkIO(process.stdout, 1);
+  const stderr = mkIO(process.stderr, 2);
+  consts.set('STDOUT', stdout);
+  consts.set('STDERR', stderr);
+  gvars['$stdout'] = stdout;
+  gvars['$stderr'] = stderr;
+  gvars['$PROGRAM_NAME'] = new RString('v8ruby');
+
+  // ---- File (class methods only; instance form via File.open is limited) ----
+  const FileC = defClass('File', IOC);
+  FileC.constants.set('SEPARATOR', new RString('/'));
+  FileC.constants.set('ALT_SEPARATOR', null);
+  FileC.constants.set('PATH_SEPARATOR', new RString(':'));
+  const P = (a) => jsstr(a);
+  sdef(FileC, 'join', (c, a) => new RString(a.map((x) => (Array.isArray(x) ? x.map(jsstr).join('/') : jsstr(x))).join('/')));
+  sdef(FileC, 'dirname', (c, a) => new RString(nodePath.dirname(P(a[0]))));
+  sdef(FileC, 'basename', (c, a) => {
+    let b = nodePath.basename(P(a[0]));
+    if (a[1]) { const suf = jsstr(a[1]); if (suf === '.*') b = b.replace(/\.[^.]+$/, ''); else if (b.endsWith(suf)) b = b.slice(0, -suf.length); }
+    return new RString(b);
+  });
+  sdef(FileC, 'extname', (c, a) => new RString(nodePath.extname(P(a[0]))));
+  sdef(FileC, 'expand_path', (c, a) => {
+    let p = P(a[0]);
+    if (p === '~' || p.startsWith('~/')) p = nodePath.join(homedir(), p.slice(1));
+    const base = a[1] ? P(a[1]) : process.cwd();
+    return new RString(nodePath.resolve(base, p));
+  });
+  sdef(FileC, 'absolute_path', FileC.smethods.get('expand_path'));
+  sdef(FileC, 'absolute_path?', (c, a) => nodePath.isAbsolute(P(a[0])));
+  sdef(FileC, 'exist?', (c, a) => fs.existsSync(P(a[0])));
+  sdef(FileC, 'exists?', FileC.smethods.get('exist?'));
+  sdef(FileC, 'file?', (c, a) => { try { return fs.statSync(P(a[0])).isFile(); } catch { return false; } });
+  sdef(FileC, 'directory?', (c, a) => { try { return fs.statSync(P(a[0])).isDirectory(); } catch { return false; } });
+  sdef(FileC, 'symlink?', (c, a) => { try { return fs.lstatSync(P(a[0])).isSymbolicLink(); } catch { return false; } });
+  sdef(FileC, 'readable?', (c, a) => { try { fs.accessSync(P(a[0]), fs.constants.R_OK); return true; } catch { return false; } });
+  sdef(FileC, 'writable?', (c, a) => { try { fs.accessSync(P(a[0]), fs.constants.W_OK); return true; } catch { return false; } });
+  sdef(FileC, 'executable?', (c, a) => { try { fs.accessSync(P(a[0]), fs.constants.X_OK); return true; } catch { return false; } });
+  sdef(FileC, 'size', (c, a) => { try { return fs.statSync(P(a[0])).size; } catch { raiseError(consts.get('Errno') ? StandardErrorC : StandardErrorC, `No such file -- ${P(a[0])}`); } });
+  sdef(FileC, 'zero?', (c, a) => { try { return fs.statSync(P(a[0])).size === 0; } catch { return false; } });
+  sdef(FileC, 'read', (c, a) => { try { return new RString(fs.readFileSync(P(a[0]), 'utf8')); } catch (e) { raiseError(LoadErrorC.superclass === ScriptErrorC ? StandardErrorC : StandardErrorC, `No such file or directory @ rb_sysopen - ${P(a[0])}`); } });
+  sdef(FileC, 'binread', FileC.smethods.get('read'));
+  sdef(FileC, 'write', (c, a) => { const t = toS(a[1]); fs.writeFileSync(P(a[0]), t); return t.length; });
+  sdef(FileC, 'readlines', (c, a) => fs.readFileSync(P(a[0]), 'utf8').split(/(?<=\n)/).filter((l) => l.length).map((l) => new RString(l)));
+  sdef(FileC, 'foreach', (c, a, blk) => { for (const l of fs.readFileSync(P(a[0]), 'utf8').split(/(?<=\n)/)) if (l.length) callBlock(blk, [new RString(l)]); return null; });
+  sdef(FileC, 'delete', (c, a) => { let n = 0; for (const x of a) { fs.unlinkSync(P(x)); n++; } return n; });
+  sdef(FileC, 'unlink', FileC.smethods.get('delete'));
+  sdef(FileC, 'rename', (c, a) => { fs.renameSync(P(a[0]), P(a[1])); return 0; });
+  sdef(FileC, 'realpath', (c, a) => new RString(fs.realpathSync(P(a[0]))));
+  sdef(FileC, 'split', (c, a) => [new RString(nodePath.dirname(P(a[0]))), new RString(nodePath.basename(P(a[0])))]);
+  sdef(FileC, 'mtime', (c, a) => mkTime(fs.statSync(P(a[0])).mtimeMs));
+  sdef(FileC, 'open', (c, a, blk) => {
+    const path = P(a[0]);
+    const mode = a[1] ? jsstr(a[1]) : 'r';
+    const fh = new RObject(FileHandleC);
+    fh.ivars['@__path'] = new RString(path);
+    fh.ivars['@__mode'] = new RString(mode);
+    if (mode.startsWith('w')) fs.writeFileSync(path, '');
+    if (blk) { try { return callBlock(blk, [fh]); } finally { /* no-op close */ } }
+    return fh;
+  });
+  const FileHandleC = defClass('File::Handle', ObjectC);
+  const fhPath = (s) => jsstr(s.ivars['@__path']);
+  def(FileHandleC, 'read', (s) => new RString(fs.readFileSync(fhPath(s), 'utf8')));
+  def(FileHandleC, 'write', (s, a) => { let n = 0; for (const x of a) { const t = toS(x); fs.appendFileSync(fhPath(s), t); n += t.length; } return n; });
+  def(FileHandleC, '<<', (s, a) => { fs.appendFileSync(fhPath(s), toS(a[0])); return s; });
+  def(FileHandleC, 'puts', (s, a) => { const out = []; const w = { write: (t) => out.push(t) }; putsTo(w, a); fs.appendFileSync(fhPath(s), out.join('')); return null; });
+  def(FileHandleC, 'print', (s, a) => { for (const x of a) fs.appendFileSync(fhPath(s), toS(x)); return null; });
+  def(FileHandleC, 'each_line', (s, a, blk) => { for (const l of fs.readFileSync(fhPath(s), 'utf8').split(/(?<=\n)/)) if (l.length) callBlock(blk, [new RString(l)]); return s; });
+  def(FileHandleC, 'readlines', (s) => fs.readFileSync(fhPath(s), 'utf8').split(/(?<=\n)/).filter((l) => l.length).map((l) => new RString(l)));
+  def(FileHandleC, 'close', () => null);
+  def(FileHandleC, 'path', (s) => s.ivars['@__path']);
+  def(FileHandleC, 'flush', (s) => s);
+
+  // ---- Dir ----
+  const DirC = defClass('Dir', ObjectC);
+  sdef(DirC, 'pwd', () => new RString(process.cwd()));
+  sdef(DirC, 'getwd', DirC.smethods.get('pwd'));
+  sdef(DirC, 'home', () => new RString(homedir()));
+  sdef(DirC, 'exist?', (c, a) => { try { return fs.statSync(P(a[0])).isDirectory(); } catch { return false; } });
+  sdef(DirC, 'entries', (c, a) => ['.', '..'].concat(fs.readdirSync(P(a[0]))).map((x) => new RString(x)));
+  sdef(DirC, 'children', (c, a) => fs.readdirSync(P(a[0])).map((x) => new RString(x)));
+  sdef(DirC, 'mkdir', (c, a) => { fs.mkdirSync(P(a[0])); return 0; });
+  sdef(DirC, 'chdir', (c, a, blk) => { const prev = process.cwd(); process.chdir(P(a[0])); if (blk) { try { return callBlock(blk, [new RString(process.cwd())]); } finally { process.chdir(prev); } } return 0; });
+  sdef(DirC, 'glob', (c, a, blk) => {
+    const pats = Array.isArray(a[0]) ? a[0].map(jsstr) : [jsstr(a[0])];
+    const base = a[1] instanceof RHash && a[1].get(R.sym('base')) ? jsstr(a[1].get(R.sym('base'))) : process.cwd();
+    const out = [];
+    for (const pat of pats) globWalk(pat, base, out);
+    const res = out.map((x) => new RString(x));
+    if (blk) { for (const x of res) callBlock(blk, [x]); return null; }
+    return res;
+  });
+  sdef(DirC, '[]', DirC.smethods.get('glob'));
+
+  // ---- Time ----
+  const TimeC = defClass('Time', ObjectC);
+  TimeC.includes.push(ComparableC);
+  function mkTime(ms, utc = false) { const o = new RObject(TimeC); o.ivars['@__ms'] = ms; o.ivars['@__utc'] = utc; return o; }
+  const tms = (s) => s.ivars['@__ms'];
+  const tdate = (s) => new Date(tms(s));
+  const isUTC = (s) => !!s.ivars['@__utc'];
+  sdef(TimeC, 'now', () => mkTime(Date.now()));
+  sdef(TimeC, 'at', (c, a) => mkTime(numVal(a[0]) * 1000));
+  def(TimeC, 'to_i', (s) => Math.floor(tms(s) / 1000));
+  def(TimeC, 'to_f', (s) => mkfloat(tms(s) / 1000));
+  def(TimeC, 'usec', (s) => Math.floor((tms(s) % 1000) * 1000));
+  def(TimeC, '+', (s, a) => mkTime(tms(s) + numVal(a[0]) * 1000, isUTC(s)));
+  def(TimeC, '-', (s, a) => {
+    if (a[0] instanceof RObject && a[0].rclass === TimeC) return mkfloat((tms(s) - tms(a[0])) / 1000);
+    return mkTime(tms(s) - numVal(a[0]) * 1000, isUTC(s));
+  });
+  def(TimeC, '<=>', (s, a) => { const o = tms(a[0]); return tms(s) < o ? -1 : tms(s) > o ? 1 : 0; });
+  def(TimeC, '==', (s, a) => a[0] instanceof RObject && a[0].rclass === TimeC && tms(s) === tms(a[0]));
+  const dget = (s, f) => { const d = tdate(s); return isUTC(s) ? d['getUTC' + f]() : d['get' + f](); };
+  def(TimeC, 'year', (s) => dget(s, 'FullYear'));
+  def(TimeC, 'month', (s) => dget(s, 'Month') + 1);
+  def(TimeC, 'mon', TimeC.methods.get('month'));
+  def(TimeC, 'day', (s) => dget(s, 'Date'));
+  def(TimeC, 'mday', TimeC.methods.get('day'));
+  def(TimeC, 'hour', (s) => dget(s, 'Hours'));
+  def(TimeC, 'min', (s) => dget(s, 'Minutes'));
+  def(TimeC, 'sec', (s) => dget(s, 'Seconds'));
+  def(TimeC, 'wday', (s) => dget(s, 'Day'));
+  def(TimeC, 'yday', (s) => { const d = tdate(s); const start = new Date(d.getFullYear(), 0, 0); return Math.floor((d - start) / 86400000); });
+  def(TimeC, 'monday?', (s) => dget(s, 'Day') === 1);
+  def(TimeC, 'sunday?', (s) => dget(s, 'Day') === 0);
+  def(TimeC, 'utc', (s) => mkTime(tms(s), true));
+  def(TimeC, 'getutc', TimeC.methods.get('utc'));
+  def(TimeC, 'gmtime', TimeC.methods.get('utc'));
+  def(TimeC, 'utc?', (s) => isUTC(s));
+  def(TimeC, 'localtime', (s) => mkTime(tms(s), false));
+  def(TimeC, 'zone', (s) => new RString(isUTC(s) ? 'UTC' : 'Local'));
+  def(TimeC, 'strftime', (s, a) => new RString(strftime(s, jsstr(a[0]))));
+  def(TimeC, 'iso8601', (s) => new RString(strftime(s, '%Y-%m-%dT%H:%M:%S%z')));
+  def(TimeC, 'to_s', (s) => new RString(strftime(s, '%Y-%m-%d %H:%M:%S %z')));
+  def(TimeC, 'inspect', TimeC.methods.get('to_s'));
+  function strftime(t, fmt) {
+    const pad = (n, w = 2, c = '0') => String(n).padStart(w, c);
+    const d = tdate(t);
+    const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+    const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const g = (f) => dget(t, f);
+    const offMin = isUTC(t) ? 0 : -d.getTimezoneOffset();
+    const tz = (offMin < 0 ? '-' : '+') + pad(Math.floor(Math.abs(offMin) / 60)) + pad(Math.abs(offMin) % 60);
+    return fmt.replace(/%(-?)([A-Za-z%])/g, (m, dash, c) => {
+      switch (c) {
+        case 'Y': return String(g('FullYear'));
+        case 'y': return pad(g('FullYear') % 100);
+        case 'm': return dash ? String(g('Month') + 1) : pad(g('Month') + 1);
+        case 'd': return dash ? String(g('Date')) : pad(g('Date'));
+        case 'e': return pad(g('Date'), 2, ' ');
+        case 'H': return dash ? String(g('Hours')) : pad(g('Hours'));
+        case 'I': return pad(((g('Hours') + 11) % 12) + 1);
+        case 'M': return dash ? String(g('Minutes')) : pad(g('Minutes'));
+        case 'S': return dash ? String(g('Seconds')) : pad(g('Seconds'));
+        case 'L': return pad(tms(t) % 1000, 3);
+        case 'j': return pad(numVal(send(t, 'yday', [])), 3);
+        case 'A': return days[g('Day')];
+        case 'a': return days[g('Day')].slice(0, 3);
+        case 'B': return months[g('Month')];
+        case 'b': return months[g('Month')].slice(0, 3);
+        case 'p': return g('Hours') < 12 ? 'AM' : 'PM';
+        case 'z': return tz;
+        case 'Z': return isUTC(t) ? 'UTC' : '';
+        case 's': return String(Math.floor(tms(t) / 1000));
+        case 'F': return `${g('FullYear')}-${pad(g('Month') + 1)}-${pad(g('Date'))}`;
+        case 'T': return `${pad(g('Hours'))}:${pad(g('Minutes'))}:${pad(g('Seconds'))}`;
+        case '%': return '%';
+        default: return m;
+      }
+    });
+  }
+
+  // ---- Process / Signal / Thread / Mutex ----
+  const ProcessM = defClass('Process', null, true);
+  ProcessM.constants.set('CLOCK_MONOTONIC', 1);
+  ProcessM.constants.set('CLOCK_REALTIME', 2);
+  sdef(ProcessM, 'pid', () => process.pid);
+  sdef(ProcessM, 'clock_gettime', () => mkfloat(Number(process.hrtime.bigint()) / 1e9));
+  sdef(ProcessM, 'exit', (c, a) => send(mainObject, 'exit', a));
+  const SignalM = defClass('Signal', null, true);
+  sdef(SignalM, 'trap', () => null);
+  def(ObjectC, 'trap', () => null);
+
+  const MutexC = defClass('Mutex', ObjectC);
+  def(MutexC, 'synchronize', (s, a, blk) => callBlock(blk, []));
+  def(MutexC, 'lock', (s) => s);
+  def(MutexC, 'unlock', (s) => s);
+  def(MutexC, 'try_lock', () => true);
+  def(MutexC, 'locked?', () => false);
+  def(MutexC, 'owned?', () => false);
+
+  const ThreadC = defClass('Thread', ObjectC);
+  ThreadC.constants.set('Mutex', MutexC);
+  const threadMain = new RObject(ThreadC);
+  threadMain.ivars['@__locals'] = new RHash();
+  sdef(ThreadC, 'current', () => threadMain);
+  sdef(ThreadC, 'main', () => threadMain);
+  sdef(ThreadC, 'new', (c, a, blk) => {
+    // single-threaded: run the block immediately and remember its value
+    const t = new RObject(ThreadC);
+    t.ivars['@__locals'] = new RHash();
+    t.ivars['@__value'] = blk ? callBlock(blk, a) : null;
+    return t;
+  });
+  sdef(ThreadC, 'start', ThreadC.smethods.get('new'));
+  def(ThreadC, '[]', (s, a) => { const h = s.ivars['@__locals']; const v = h.get(a[0]); return v === undefined ? null : v; });
+  def(ThreadC, '[]=', (s, a) => { s.ivars['@__locals'].set(a[0], a[1]); return a[1]; });
+  def(ThreadC, 'key?', (s, a) => s.ivars['@__locals'].has(a[0]));
+  def(ThreadC, 'join', (s) => s);
+  def(ThreadC, 'value', (s) => (s.ivars['@__value'] ?? null));
+  def(ThreadC, 'alive?', () => false);
+  def(ThreadC, 'kill', (s) => s);
+
+  // ---- Data.define ----
+  const DataC = defClass('Data', ObjectC);
+  sdef(DataC, 'define', (cls, args, blk) => {
+    const members = args.map((x) => symstr(x));
+    const klass = new RClass(null, DataC);
+    klass.ivars['@__members'] = members;
+    for (const m of members) klass.methods.set(m, (self) => (self.ivars['@' + m] ?? null));
+    klass.smethods.set('members', () => members.map((m) => R.sym(m)));
+    klass.smethods.set('new', (kc, aa, b) => {
+      if (kc !== klass && kc instanceof RClass) { /* subclass: same behavior */ }
+      const obj = new RObject(kc instanceof RClass ? kc : klass);
+      if (aa.length === 1 && aa[0] instanceof RHash && members.length !== 1) {
+        for (const m of members) obj.ivars['@' + m] = aa[0].has(R.sym(m)) ? aa[0].get(R.sym(m)) : null;
+      } else if (aa.length && aa[aa.length - 1] instanceof RHash && aa.length - 1 < members.length) {
+        const kw = aa[aa.length - 1];
+        aa.slice(0, -1).forEach((v, i) => { obj.ivars['@' + members[i]] = v; });
+        for (const m of members) if (kw.has(R.sym(m))) obj.ivars['@' + m] = kw.get(R.sym(m));
+      } else {
+        if (aa.length > members.length) raiseError(ArgumentErrorC, 'wrong number of arguments');
+        members.forEach((m, i) => { obj.ivars['@' + m] = i < aa.length ? aa[i] : null; });
+      }
+      return obj;
+    });
+    klass.smethods.set('[]', klass.smethods.get('new'));
+    klass.methods.set('members', () => members.map((m) => R.sym(m)));
+    klass.methods.set('to_h', (self) => { const h = new RHash(); for (const m of members) h.set(R.sym(m), self.ivars['@' + m] ?? null); return h; });
+    klass.methods.set('deconstruct', (self) => members.map((m) => self.ivars['@' + m] ?? null));
+    klass.methods.set('with', (self, aa) => { const o = new RObject(self.rclass); Object.assign(o.ivars, self.ivars); if (aa[0] instanceof RHash) for (const [k, v] of aa[0].entries()) o.ivars['@' + symstr(k)] = v; return o; });
+    klass.methods.set('==', (self, aa) => { const o = aa[0]; if (!(o instanceof RObject) || o.rclass !== self.rclass) return false; return members.every((m) => rbEqual(self.ivars['@' + m] ?? null, o.ivars['@' + m] ?? null)); });
+    klass.methods.set('inspect', (self) => { const nm = self.rclass.name ? ' ' + self.rclass.name : ''; return new RString(`#<data${nm} ${members.map((m) => `${m}=${inspect(self.ivars['@' + m] ?? null)}`).join(', ')}>`); });
+    klass.methods.set('to_s', klass.methods.get('inspect'));
+    if (blk) { pushDefinee(klass); try { callBlock(blk, [klass], klass); } finally { popDefinee(); } }
+    return klass;
+  });
+
+  // ---- Kernel: at_exit, autoload ----
+  def(ObjectC, 'at_exit', (self, a, blk) => { if (blk) R.__atexit.push(blk); return blk; });
+  def(ObjectC, 'autoload', (self, a) => { autoloads.set(symstr(a[0]), a[1]); return null; });
+  def(ObjectC, 'exit!', ObjectC.methods.get('exit'));
+  def(ObjectC, 'caller_locations', () => []);
+  def(ObjectC, 'binding', () => null);
+
+  // ---- RUBY_* constants ----
+  const arch = process.arch === 'arm64' ? 'aarch64' : process.arch === 'x64' ? 'x86_64' : process.arch;
+  consts.set('RUBY_VERSION', new RString('3.4.0'));
+  consts.set('RUBY_ENGINE', new RString('v8ruby'));
+  consts.set('RUBY_ENGINE_VERSION', new RString('0.1.0'));
+  consts.set('RUBY_PLATFORM', new RString(`${arch}-linux`));
+  consts.set('RUBY_RELEASE_DATE', new RString('2026-06-10'));
+  consts.set('RUBY_DESCRIPTION', new RString(`v8ruby 0.1.0 (Ruby on V8 ${process.versions.v8})`));
+  consts.set('RUBY_COPYRIGHT', new RString('v8ruby'));
+  consts.set('RUBY_PATCHLEVEL', 0);
+  consts.set('ARGV', []);
+  const envHash = new RHash();
+  for (const [k, v] of Object.entries(process.env)) envHash.set(new RString(k), new RString(v));
+  consts.set('ENV', envHash);
+}
+
+// Generic puts onto any sink with .write (used by IO#puts and File handles).
+function putsTo(sink, args) {
+  if (args.length === 0) { sink.write('\n'); return; }
+  for (const a of args) {
+    if (Array.isArray(a)) { if (a.length === 0) sink.write('\n'); else putsTo(sink, a); }
+    else { const s = toS(a); sink.write(s.endsWith('\n') ? s : s + '\n'); }
+  }
+}
+
+// Minimal glob: supports **, *, ?, {a,b} and [] classes.
+function globWalk(pattern, base, out) {
+  const abs = nodePath.isAbsolute(pattern);
+  const root = abs ? '/' : base;
+  const pat = abs ? pattern.slice(1) : pattern;
+  const re = globToRegex(pat);
+  const results = [];
+  const walk = (dir, rel, depth) => {
+    if (depth > 25) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.') && !pat.includes('.*') && !pat.startsWith('.')) continue;
+      const r = rel ? rel + '/' + e.name : e.name;
+      if (re.test(r)) results.push(abs ? '/' + r : r);
+      if (e.isDirectory()) walk(nodePath.join(dir, e.name), r, depth + 1);
+    }
+  };
+  walk(root, '', 0);
+  results.sort();
+  out.push(...results);
+}
+function globToRegex(pat) {
+  let out = '';
+  let i = 0;
+  while (i < pat.length) {
+    const c = pat[i];
+    if (c === '*' && pat[i + 1] === '*') {
+      // `**/` matches zero or more directories
+      if (pat[i + 2] === '/') { out += '(?:.*/)?'; i += 3; } else { out += '.*'; i += 2; }
+    } else if (c === '*') { out += '[^/]*'; i++; }
+    else if (c === '?') { out += '[^/]'; i++; }
+    else if (c === '{') {
+      const end = pat.indexOf('}', i);
+      const alts = pat.slice(i + 1, end).split(',');
+      out += '(?:' + alts.map((a) => a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')';
+      i = end + 1;
+    } else if (c === '[') {
+      const end = pat.indexOf(']', i);
+      out += pat.slice(i, end + 1);
+      i = end + 1;
+    } else { out += c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); i++; }
+  }
+  return new RegExp('^' + out + '$');
 }
 
 // ---- Math -----------------------------------------------------------------
