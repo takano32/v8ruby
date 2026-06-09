@@ -91,6 +91,7 @@ class NextError { constructor(value) { this.value = value; } }
 class ReturnError { constructor(value) { this.value = value; } }
 class RedoError {}
 class RetryError {}
+class ThrowSignal { constructor(tag, value) { this.tag = tag; this.value = value; } }
 class StopIterationSignal { constructor(value) { this.value = value; } }
 // A thrown Ruby exception object.
 class RubyError extends Error {
@@ -478,7 +479,7 @@ function sprintf(fmt, args) {
       switch (conv) {
         case 'd': case 'i': s = String(Math.trunc(numVal(arg))); break;
         case 'f': s = numVal(arg).toFixed(prec === undefined ? 6 : +prec); break;
-        case 'e': s = numVal(arg).toExponential(prec === undefined ? 6 : +prec); break;
+        case 'e': s = numVal(arg).toExponential(prec === undefined ? 6 : +prec).replace(/e([+-])(\d)$/, 'e$10$2'); break;
         case 'g': case 'G': s = String(numVal(arg)); break;
         case 's': s = toS(arg); if (prec !== undefined) s = s.slice(0, +prec); break;
         case 'x': s = Math.trunc(numVal(arg)).toString(16); break;
@@ -541,7 +542,7 @@ const R = {
   toS, inspect,
 
   // exceptions
-  RubyError, BreakError, NextError, ReturnError, RedoError, RetryError, StopIterationSignal,
+  RubyError, BreakError, NextError, ReturnError, RedoError, RetryError, ThrowSignal, StopIterationSignal,
   raise: rbRaise,
   raiseError,
 
@@ -895,6 +896,14 @@ function installKernel() {
   def(ObjectC, 'to_enum', (self, args) => self);
   def(ObjectC, 'display', (self) => { out(toS(self)); return null; });
   def(ObjectC, 'caller', () => []);
+  def(ObjectC, 'catch', (self, args, blk) => {
+    const tag = args.length ? args[0] : new RObject(ObjectC);
+    try { return callBlock(blk, [tag], self); }
+    catch (e) { if (e instanceof ThrowSignal && rbEqual(e.tag, tag)) return e.value; throw e; }
+  });
+  def(ObjectC, 'throw', (self, args) => { throw new ThrowSignal(args[0], args.length > 1 ? args[1] : null); });
+  def(ObjectC, 'warn', (self, args) => { for (const a of args) process.stderr.write(toS(a) + '\n'); return null; });
+  def(ObjectC, '__method__', (self) => null);
 }
 
 function ivName(s) { const n = s instanceof RSymbol ? s.name : jsstr(s); return n.startsWith('@') ? n : '@' + n; }
@@ -945,9 +954,9 @@ function installInteger() {
   def(I, '<<', (s, a) => s * Math.pow(2, a[0]));
   def(I, '>>', (s, a) => Math.floor(s / Math.pow(2, a[0])));
   def(I, 'times', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (let i = 0; i < s; i++) yield i; }); try { for (let i = 0; i < s; i++) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
-  def(I, 'upto', (s, a, blk) => { const to = numVal(a[0]); try { for (let i = s; i <= to; i++) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
-  def(I, 'downto', (s, a, blk) => { const to = numVal(a[0]); try { for (let i = s; i >= to; i--) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
-  def(I, 'step', (s, a, blk) => { const to = numVal(a[0]); const by = a[1] != null ? numVal(a[1]) : 1; try { if (by > 0) for (let i = s; i <= to; i += by) safeYield(blk, [i]); else for (let i = s; i >= to; i += by) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
+  def(I, 'upto', (s, a, blk) => { const to = numVal(a[0]); if (!blk) return mkEnum(function* () { for (let i = s; i <= to; i++) yield i; }); try { for (let i = s; i <= to; i++) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
+  def(I, 'downto', (s, a, blk) => { const to = numVal(a[0]); if (!blk) return mkEnum(function* () { for (let i = s; i >= to; i--) yield i; }); try { for (let i = s; i >= to; i--) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
+  def(I, 'step', (s, a, blk) => { const to = numVal(a[0]); const by = a[1] != null ? numVal(a[1]) : 1; if (!blk) return mkEnum(function* () { if (by > 0) { for (let i = s; i <= to; i += by) yield i; } else { for (let i = s; i >= to; i += by) yield i; } }); try { if (by > 0) for (let i = s; i <= to; i += by) safeYield(blk, [i]); else for (let i = s; i >= to; i += by) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
   def(I, 'abs', (s) => Math.abs(s));
   def(I, 'magnitude', (s) => Math.abs(s));
   def(I, 'even?', (s) => s % 2 === 0);
@@ -1054,7 +1063,7 @@ function installFloat() {
   def(F, 'between?', (s, a) => s.value >= numVal(a[0]) && s.value <= numVal(a[1]));
   def(F, 'clamp', (s, a) => { const lo = numVal(a[0]), hi = numVal(a[1]); return mkfloat(s.value < lo ? lo : s.value > hi ? hi : s.value); });
   def(F, 'nonzero?', (s) => (s.value === 0 ? null : s));
-  def(F, 'step', (s, a, blk) => { const to = numVal(a[0]); const by = a[1] != null ? numVal(a[1]) : 1; try { if (by > 0) for (let i = s.value; i <= to + 1e-9; i += by) safeYield(blk, [mkfloat(i)]); else for (let i = s.value; i >= to - 1e-9; i += by) safeYield(blk, [mkfloat(i)]); } catch (e) { return brk(e); } return s; });
+  def(F, 'step', (s, a, blk) => { const to = numVal(a[0]); const by = a[1] != null ? numVal(a[1]) : 1; if (!blk) return mkEnum(function* () { if (by > 0) { for (let i = s.value; i <= to + 1e-9; i += by) yield mkfloat(i); } else { for (let i = s.value; i >= to - 1e-9; i += by) yield mkfloat(i); } }); try { if (by > 0) for (let i = s.value; i <= to + 1e-9; i += by) safeYield(blk, [mkfloat(i)]); else for (let i = s.value; i >= to - 1e-9; i += by) safeYield(blk, [mkfloat(i)]); } catch (e) { return brk(e); } return s; });
 }
 function floatRound(v, a, fn) {
   const d = a && a[0] != null ? numVal(a[0]) : 0;

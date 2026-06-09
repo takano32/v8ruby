@@ -624,7 +624,7 @@ export class Compiler {
       core = 'try {\n' + tryBody + '\n}';
       const errv = '$err';
       core += ` catch (${errv}) {\n`;
-      core += `if (${errv} instanceof R.ReturnError || ${errv} instanceof R.BreakError || ${errv} instanceof R.NextError || ${errv} instanceof R.RetryError) throw ${errv};\n`;
+      core += `if (${errv} instanceof R.ReturnError || ${errv} instanceof R.BreakError || ${errv} instanceof R.NextError || ${errv} instanceof R.RetryError || ${errv} instanceof R.ThrowSignal) throw ${errv};\n`;
       core += `const $exc = (${errv} instanceof R.RubyError) ? ${errv}.rubyObj : R.wrapJsError(${errv});\n`;
       let first = true;
       for (const r of node.rescues) {
