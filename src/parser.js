@@ -461,7 +461,9 @@ export class Parser {
       }
       if (['-', '+', '*', '**', '&'].includes(t.value)) {
         if (localName && this.knownLocals.has(localName)) return false; // local var: binary op
-        return next && !next.spaceBefore; // unary use: no space after the sign
+        // unary use: no space after the sign, and a real operand follows (a
+        // NEWLINE after the sign means it's a binary op continued on the next line)
+        return next && !next.spaceBefore && next.type !== 'NEWLINE' && next.type !== 'EOF';
       }
       if (t.value === '[') return true;
       if (t.value === '(') return true; // `puts (expr)` => puts((expr))
@@ -533,12 +535,21 @@ export class Parser {
       hashPairs.push({ key: N('SymLit', { name: key }), value });
       return null;
     }
-    const e = this.parseTernary();
+    let e = this.parseTernary();
     if (this.atOp('=>')) {
       this.advance(); this.skipNL();
       const value = this.parseTernary();
       hashPairs.push({ key: e, value });
       return null;
+    }
+    // assignment / op-assignment in argument position: foo(h[k] ||= v), foo(x = 1)
+    const t = this.cur();
+    if (t.type === 'OP' && ASSIGN_OPS.has(t.value) && this.isAssignable(e)) {
+      this.advance(); this.skipNL();
+      if (e.type === 'Ident') this.noteLocal(e.name);
+      const value = this.parseTernary();
+      e = t.value === '=' ? N('Assign', { target: e, value })
+        : N('OpAssign', { target: e, op: t.value.slice(0, -1), value });
     }
     return { arg: e };
   }
@@ -980,12 +991,12 @@ export class Parser {
   parseDef() {
     this.advance();
     let singleton = null;
-    // def self.name / def Foo.name
+    // def self.name / def Foo.name / def Foo::name
     if ((this.atKw('self') || this.atType('CONST') || this.atType('IDENT')) &&
-        this.peek().type === 'OP' && this.peek().value === '.') {
+        this.peek().type === 'OP' && (this.peek().value === '.' || this.peek().value === '::')) {
       if (this.atKw('self')) { this.advance(); singleton = N('Self', {}); }
       else { const tk = this.advance(); singleton = tk.type === 'CONST' ? N('Const', { name: tk.value }) : N('Ident', { name: tk.value }); }
-      this.expectOp('.');
+      this.advance(); // consume `.` or `::`
     }
     const name = this.parseDefName();
     let params = [];

@@ -8,6 +8,9 @@
 # rest substring, not the full string before pos.
 
 class StringScanner
+  Version = "3.1.0"
+  Id = "v8ruby strscan shim"
+
   class Error < StandardError; end
 
   attr_reader :string

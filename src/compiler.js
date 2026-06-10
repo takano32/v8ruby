@@ -330,7 +330,9 @@ export class Compiler {
       case 'IVar': return `R.ivarGet(${this.selfRef}, ${this.q(node.name)})`;
       case 'CVar': return `R.cvarGet(${this.classRef}, ${this.q(node.name)})`;
       case 'GVar': return `R.gvarGet(${this.q(node.name)})`;
-      case 'Const': return `R.constResolve(${this.nestingJson()}, ${this.classRef}, ${this.q(node.name)})`;
+      case 'Const': return node.topLevel
+        ? `R.constGet(${this.q(node.name)})`
+        : `R.constResolve(${this.nestingJson()}, ${this.classRef}, ${this.q(node.name)})`;
       case 'ConstPath': return `R.constGetFrom(${this.gen(node.base)}, ${this.q(node.name)})`;
       case 'Assign': return this.genAssign(node);
       case 'OpAssign': return this.genOpAssign(node);
