@@ -756,22 +756,18 @@ export class Compiler {
   }
 
   genSingletonClass(node) {
-    // class << self ... end  — define singleton methods on the object/class.
+    // class << obj ... end — open obj's singleton class. The body runs with the
+    // singleton class as the current definee, so any `def`/attr/alias (even when
+    // nested in if/case/begin) becomes a singleton method on obj.
     const obj = this.gen(node.obj);
     const scope = node.__scope;
-    const prevScope = this.scope, prevClassRef = this.classRef, prevCtx = this.ctx;
-    this.scope = scope; this.ctx = ['method'];
-    // Within `class << self`, plain `def` becomes a singleton method on obj.
-    const tv = this.t();
-    this.classRef = tv;
-    const stmts = node.body.map((s) => {
-      if (s.type === 'Def') { s.singleton = { type: 'SelfRef' }; }
-      return s;
-    });
-    // generate defs targeting the object as singleton
-    const parts = node.body.map((s) => this.genSingletonMember(s, tv)).join('\n');
-    this.scope = prevScope; this.classRef = prevClassRef; this.ctx = prevCtx;
-    return `((${tv}) => { ${parts} return null; })(${obj})`;
+    const prevScope = this.scope, prevClassRef = this.classRef, prevCtx = this.ctx, prevSelf = this.selfRef;
+    this.scope = scope; this.classRef = '$cls'; this.ctx = ['method']; this.selfRef = '$self';
+    const decls = this.declList(scope);
+    const body = this.genReturningBody(node.body);
+    this.scope = prevScope; this.classRef = prevClassRef; this.ctx = prevCtx; this.selfRef = prevSelf;
+    const builder = `function ($cls) {\nconst $self = $cls;\nconst $blk = null;\n${decls}\n${body}\n}`;
+    return `R.defineSingletonClass(${obj}, ${builder})`;
   }
 
   genSingletonMember(node, target) {

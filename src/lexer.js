@@ -14,7 +14,7 @@ const KEYWORDS = new Set([
 const OPERATORS = [
   '**=', '<=>', '===', '...', '||=', '&&=', '<<=', '>>=', '**',
   '==', '!=', '>=', '<=', '&&', '||', '<<', '>>', '+=', '-=', '*=', '/=',
-  '%=', '|=', '&=', '^=', '..', '=>', '->', '::', '=~', '&.',
+  '%=', '|=', '&=', '^=', '..', '=>', '->', '::', '=~', '!~', '&.',
   '+', '-', '*', '/', '%', '=', '<', '>', '!', '&', '|', '^', '~', '?', ':',
   '.', ',', '(', ')', '[', ']', '{', '}', ';',
 ];
@@ -184,6 +184,23 @@ export class Lexer {
         this.peek(1) === '@' || this.peek(1) === '$' ||
         '+-*/%<>=!~&|^['.includes(this.peek(1)))) {
       return this.scanSymbol();
+    }
+
+    // Character literal: ?a -> "a", ?\n -> "\n". Allowed at value position or
+    // after whitespace (e.g. `puts ?a`); requires a single char with no space
+    // after `?` (so `x ? a : b` stays a ternary, and `?ab` is `? ab`).
+    if (c === '?' && (this.prevAllowsValue() || this.spaceBefore)) {
+      const n1 = this.peek(1);
+      if (n1 === '\\') {
+        this.pos++; // consume `?`
+        const ch = this.scanEscape();
+        return this.push('STRING', [{ str: ch }]);
+      }
+      if (n1 !== undefined && n1 !== ' ' && n1 !== '\t' && n1 !== '\n' &&
+          !(isIdentPart(n1) && isIdentPart(this.peek(2) ?? ''))) {
+        this.pos += 2; // consume `?` and the char
+        return this.push('STRING', [{ str: n1 }]);
+      }
     }
 
     if (isIdentStart(c)) return this.scanIdentifier();
@@ -559,7 +576,9 @@ export class Lexer {
   }
 
   isDelim(c) {
-    return c !== undefined && '[({<!|/'.includes(c);
+    // Ruby allows any non-alphanumeric, non-whitespace char as a %-literal
+    // delimiter (e.g. %r"..." , %q|...|). `=` is excluded so `%=` stays modulo-assign.
+    return c !== undefined && c !== '=' && !/[a-zA-Z0-9\s]/.test(c);
   }
   closeDelim(open) {
     return { '[': ']', '(': ')', '{': '}', '<': '>' }[open] || open;

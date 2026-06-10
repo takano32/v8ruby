@@ -11,7 +11,7 @@ const N = (type, props) => ({ type, ...props });
 // `**` is handled separately (right-assoc, tighter than unary) in parsePow.
 const BINPREC = {
   '||': 3, '&&': 4,
-  '==': 5, '!=': 5, '===': 5, '<=>': 5, '=~': 5,
+  '==': 5, '!=': 5, '===': 5, '<=>': 5, '=~': 5, '!~': 5,
   '<': 6, '<=': 6, '>': 6, '>=': 6,
   '|': 7, '^': 7,
   '&': 8,
@@ -454,7 +454,12 @@ export class Parser {
     if (t.type === 'OP') {
       // `foo -1` / `foo *x` / `foo &blk` / `foo :sym` / `foo [1]` / `foo ->{}`
       const next = this.peek();
-      if (['-', '+', '*', '**', '&', '::'].includes(t.value)) {
+      // `foo ::Bar` (space before ::, const after) is a command arg, never a
+      // binary op on a local — so don't apply the known-local guard here.
+      if (t.value === '::') {
+        return next && next.type === 'CONST' && !next.spaceBefore;
+      }
+      if (['-', '+', '*', '**', '&'].includes(t.value)) {
         if (localName && this.knownLocals.has(localName)) return false; // local var: binary op
         return next && !next.spaceBefore; // unary use: no space after the sign
       }
@@ -635,7 +640,16 @@ export class Parser {
     switch (t.type) {
       case 'INT': this.advance(); return N('IntLit', { value: t.value });
       case 'FLOAT': this.advance(); return N('FloatLit', { value: t.value });
-      case 'STRING': this.advance(); return this.makeString(t.value);
+      case 'STRING': {
+        this.advance();
+        // Adjacent string literals concatenate: "a" "b" (often across `\` line
+        // continuations) becomes a single string with the parts joined.
+        let parts = t.value;
+        while (this.atType('STRING')) {
+          parts = parts.concat(this.advance().value);
+        }
+        return this.makeString(parts);
+      }
       case 'SYMBOL': this.advance(); return N('SymLit', { name: t.value });
       case 'REGEX': {
         this.advance();
@@ -742,14 +756,15 @@ export class Parser {
   }
 
   parseStatementInParens() {
-    // allow a sequence `(a; b)` -> last value; commonly just one expr
-    let node = this.parseStatement();
+    // a sequence `(a; b; c)` evaluates each statement and yields the last value
+    const stmts = [this.parseStatement()];
     while (this.atOp(';') || this.atType('NEWLINE')) {
       this.skipTerminators();
       if (this.atOp(')')) break;
-      node = this.parseStatement();
+      stmts.push(this.parseStatement());
     }
-    return node;
+    if (stmts.length === 1) return stmts[0];
+    return N('Begin', { body: stmts, rescues: [], elseBody: null, ensureBody: null });
   }
 
   parseHashBody() {
@@ -1092,7 +1107,8 @@ export class Parser {
     let value = null;
     if (!this.atType('NEWLINE') && !this.atOp(';') && !this.atEOF() &&
         !this.atKw('end') && !this.atKw('if') && !this.atKw('unless') &&
-        !this.atOp('}')) {
+        !this.atKw('while') && !this.atKw('until') &&
+        !this.atOp('}') && !this.atOp(')') && !this.atOp(']')) {
       value = this.parseExpression();
       // multiple return values -> array
       if (this.atOp(',')) {

@@ -659,7 +659,7 @@ const R = {
 
   // class building (used by compiled class/module/def)
   defineClass, defineModule, defineMethod, defineSMethod, includeModule,
-  defineAttr, openSingleton, aliasSingleton,
+  defineAttr, openSingleton, defineSingletonClass, aliasSingleton,
   currentDefinee, pushDefinee, popDefinee,
 
   // operators that need centralizing
@@ -818,13 +818,19 @@ function constDefined(nesting, cls, name) {
   return consts.has(name) || autoloads.has(name);
 }
 function constGetFrom(base, name) {
-  let c = base instanceof RClass ? base : null;
-  while (c) {
-    if (c.constants.has(name)) return c.constants.get(name);
-    c = c.superclass;
-  }
-  if (consts.has(name)) return consts.get(name);
-  if (tryAutoload(name) && consts.has(name)) return consts.get(name);
+  const search = () => {
+    let c = base instanceof RClass ? base : null;
+    while (c) {
+      if (c.constants.has(name)) return c.constants.get(name);
+      c = c.superclass;
+    }
+    if (consts.has(name)) return consts.get(name);
+    return undefined;
+  };
+  let v = search();
+  if (v !== undefined) return v;
+  // Autoload may define the constant in `base` (nested module) or globally.
+  if (tryAutoload(name)) { v = search(); if (v !== undefined) return v; }
   raiseError(NameErrorC, `uninitialized constant ${base instanceof RClass && base.name ? base.name + '::' : ''}${name}`);
 }
 
@@ -903,6 +909,23 @@ function openSingleton(obj, builder) {
   // class << obj : define singleton methods. We support obj being a class.
   if (obj instanceof RClass) builder({ defS: (n, fn) => obj.smethods.set(n, fn) });
   return null;
+}
+
+// Synthetic singleton class whose method table IS the object's singleton-method
+// map, so a `def` anywhere in a `class << obj` body (even nested in if/case)
+// targets it via the normal currentDefinee() mechanism.
+function singletonClassOf(obj) {
+  if (obj.__sclass) return obj.__sclass;
+  const sc = new RClass('#<Class:' + (obj.name || 'obj') + '>', ClassC || null);
+  sc.methods = obj instanceof RClass ? obj.smethods : (obj.smeth || (obj.smeth = new Map()));
+  sc.__singletonOf = obj;
+  obj.__sclass = sc;
+  return sc;
+}
+function defineSingletonClass(obj, builder) {
+  const sc = singletonClassOf(obj);
+  pushDefinee(sc);
+  try { const r = builder(sc); return r === undefined ? null : r; } finally { popDefinee(); }
 }
 
 function defineAttr(cls, kind, names, singleton = false) {
