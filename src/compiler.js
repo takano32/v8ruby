@@ -130,6 +130,12 @@ function analyze(node, scope) {
       if (node.block) analyzeBlock(node.block, scope);
       return;
     }
+    case 'Super': {
+      if (node.args) analyze(node.args, scope);
+      if (node.blockArg) analyze(node.blockArg, scope);
+      if (node.block) analyzeBlock(node.block, scope);
+      return;
+    }
     case 'If': {
       analyze(node.cond, scope);
       analyze(node.then, scope);
@@ -228,6 +234,7 @@ export class Compiler {
       'const $self = R.main;',
       'const $blk = null;',
       'const $cls = R.consts.get("Object");',
+      'const $frame = R.nextFrame();',
       decls,
       body,
     ].filter(Boolean).join('\n');
@@ -269,7 +276,11 @@ export class Compiler {
     const inner = this.genReturningBody(stmts);
     let body = [decls, inner].filter(Boolean).join('\n');
     if (wrapReturn) {
-      body = `try {\n${body}\n} catch ($e) { if ($e instanceof R.ReturnError) return $e.value; throw $e; }`;
+      // Each method/lambda gets a fresh frame id; a `return` (here or in a nested
+      // block) carries the frame of the method it lexically belongs to. We only
+      // unwind here when the frame matches ours — otherwise it's a block's return
+      // targeting an outer method, so let it propagate.
+      body = `const $frame = R.nextFrame();\ntry {\n${body}\n} catch ($e) { if ($e instanceof R.ReturnError) { if ($e.frame === $frame) return $e.value; throw $e; } throw $e; }`;
     }
     return body;
   }
@@ -580,7 +591,9 @@ export class Compiler {
 
   genReturn(node) {
     const v = node.value ? this.gen(node.value) : 'null';
-    return `throw new R.ReturnError(${v});`;
+    // $frame is the lexically-enclosing method/lambda/top-level frame; a block
+    // captures it via closure so its `return` targets the defining method.
+    return `throw new R.ReturnError(${v}, $frame);`;
   }
 
   genBreak(node) {
@@ -897,7 +910,8 @@ export class Compiler {
   }
 
   genSuper(node) {
-    const block = '$blk';
+    // A block attached to `super do ... end` (or `&blk`) overrides the method's own $blk.
+    const block = this.genBlockArg(node) || '$blk';
     if (node.args === null) {
       return `R.superCall(${this.selfRef}, ${this.classRef}, ${this.q(this.methodName)}, $args, ${block})`;
     }

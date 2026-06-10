@@ -114,7 +114,11 @@ class RHash {
 // Non-local control-flow signals.
 class BreakError { constructor(value) { this.value = value; } }
 class NextError { constructor(value) { this.value = value; } }
-class ReturnError { constructor(value) { this.value = value; } }
+// frame identifies the method/lambda invocation a `return` targets, so a block's
+// `return` unwinds to the method where the block was defined (not the yielder).
+class ReturnError { constructor(value, frame = null) { this.value = value; this.frame = frame; } }
+let frameCounter = 0;
+function nextFrame() { return ++frameCounter; }
 class RedoError {}
 class RetryError {}
 class ThrowSignal { constructor(tag, value) { this.tag = tag; this.value = value; } }
@@ -628,6 +632,7 @@ const R = {
 
   // exceptions
   RubyError, BreakError, NextError, ReturnError, RedoError, RetryError, ThrowSignal, StopIterationSignal,
+  nextFrame,
   raise: rbRaise,
   raiseError,
 
@@ -1599,7 +1604,7 @@ function installArray() {
   def(A, 'each_with_index', (s, a, blk) => { if (!blk) return mkEnum(function* () { let i = 0; for (const x of s) yield [x, i++]; }); const r = yieldEach(s, blk, (i) => callBlock(blk, [s[i], i])); return r !== undefined ? r : s; });
   def(A, 'each_index', (s, a, blk) => { const r = yieldEach(s, blk, (i) => callBlock(blk, [i])); return r !== undefined ? r : s; });
   def(A, 'each_with_object', (s, a, blk) => { const obj = a[0]; try { for (const x of s) callBlock(blk, [x, obj]); } catch (e) { return brk(e); } return obj; });
-  def(A, 'reverse_each', (s, a, blk) => { try { for (let i = s.length - 1; i >= 0; i--) callBlock(blk, [s[i]]); } catch (e) { return brk(e); } return s; });
+  def(A, 'reverse_each', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (let i = s.length - 1; i >= 0; i--) yield s[i]; }); try { for (let i = s.length - 1; i >= 0; i--) callBlock(blk, [s[i]]); } catch (e) { return brk(e); } return s; });
   def(A, 'map', (s, a, blk) => { if (!blk) return mkEnum(function* () { yield* s; }); const out = []; try { for (const x of s) out.push(callBlock(blk, [x])); } catch (e) { return brk(e); } return out; });
   def(A, 'collect', A.methods.get('map'));
   def(A, 'map!', (s, a, blk) => { checkFrozen(s); for (let i = 0; i < s.length; i++) s[i] = callBlock(blk, [s[i]]); return s; });
@@ -1905,8 +1910,11 @@ function installProc() {
 }
 function callProc(s, a, blk) {
   if (s.isLambda) {
+    // A lambda's own `return`/`next` is caught inside its compiled body (frame
+    // match); only `next` (NextError) escapes to here. A ReturnError reaching
+    // this point belongs to an outer method, so let it propagate.
     try { return s.fn(a, undefined); }
-    catch (e) { if (e instanceof ReturnError) return e.value; if (e instanceof NextError) return e.value; throw e; }
+    catch (e) { if (e instanceof NextError) return e.value; throw e; }
   }
   return s.fn(a, undefined);
 }
@@ -1959,7 +1967,9 @@ function installEnumerable() {
     'reduce', 'inject', 'sum', 'min', 'max', 'min_by', 'max_by', 'sort', 'sort_by',
     'count', 'to_a', 'include?', 'first', 'group_by', 'partition', 'flat_map',
     'each_with_index', 'each_with_object', 'all?', 'any?', 'none?', 'tally',
-    'take', 'drop', 'each_slice', 'each_cons', 'zip', 'find_index', 'uniq', 'filter_map']) {
+    'take', 'drop', 'each_slice', 'each_cons', 'zip', 'find_index', 'uniq', 'filter_map',
+    'reverse_each', 'take_while', 'drop_while', 'chunk_while', 'find_all', 'minmax',
+    'each_entry', 'collect_concat', 'sort_by']) {
     def(E, name, (s, a, blk) => send(collect(s), name, a, blk));
   }
   def(E, 'entries', (s) => collect(s));
@@ -2165,6 +2175,12 @@ function installRegexp() {
     const srcs = parts.map((p) => p instanceof RRegexp ? p.source : jsstr(p).replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&'));
     return new RRegexp(srcs.join('|'), '');
   });
+  sdef(RG, 'last_match', (cls, a) => {
+    const md = gvars['$~'] ?? null;
+    if (md == null) return null;
+    if (a.length === 0) return md;
+    return send(md, '[]', [a[0]]);
+  });
   def(RG, 'match?', (s, a) => { const str = jsstr(a[0]); return s.re.test(str); });
   def(RG, 'match', (s, a) => { const str = jsstr(a[0]); const m = str.match(new RegExp(s.re.source, s.re.flags.replace('g', ''))); gvars['$~'] = m ? mkMatchData(m, str) : null; return m ? mkMatchData(m, str) : null; });
   def(RG, '=~', (s, a) => { if (!(a[0] instanceof RString)) return null; const m = a[0].value.match(new RegExp(s.re.source, s.re.flags.replace('g', ''))); return m ? m.index : null; });
@@ -2291,6 +2307,10 @@ function installNodeCore() {
   sdef(DirC, 'entries', (c, a) => ['.', '..'].concat(fs.readdirSync(P(a[0]))).map((x) => new RString(x)));
   sdef(DirC, 'children', (c, a) => fs.readdirSync(P(a[0])).map((x) => new RString(x)));
   sdef(DirC, 'mkdir', (c, a) => { fs.mkdirSync(P(a[0])); return 0; });
+  sdef(DirC, 'delete', (c, a) => { fs.rmdirSync(P(a[0])); return 0; });
+  sdef(DirC, 'rmdir', DirC.smethods.get('delete'));
+  sdef(DirC, 'unlink', DirC.smethods.get('delete'));
+  sdef(DirC, 'empty?', (c, a) => { try { return fs.readdirSync(P(a[0])).length === 0; } catch { return false; } });
   sdef(DirC, 'chdir', (c, a, blk) => { const prev = process.cwd(); process.chdir(P(a[0])); if (blk) { try { return callBlock(blk, [new RString(process.cwd())]); } finally { process.chdir(prev); } } return 0; });
   sdef(DirC, 'glob', (c, a, blk) => {
     const pats = Array.isArray(a[0]) ? a[0].map(jsstr) : [jsstr(a[0])];
@@ -2495,20 +2515,41 @@ function globWalk(pattern, base, out) {
   const abs = nodePath.isAbsolute(pattern);
   const root = abs ? '/' : base;
   const pat = abs ? pattern.slice(1) : pattern;
-  const re = globToRegex(pat);
+  const segments = pat.split('/');
   const results = [];
-  const walk = (dir, rel, depth) => {
-    if (depth > 25) return;
+  // Match the pattern one path-segment at a time so explicitly-named hidden
+  // directories (e.g. `.rbenv`) are traversed, while wildcard segments still
+  // skip dotfiles like MRI's Dir.glob does.
+  const walk = (dir, rel, segIdx, depth) => {
+    if (depth > 64) return;
+    if (segIdx >= segments.length) { results.push(abs ? '/' + rel : rel); return; }
+    const seg = segments[segIdx];
+    const last = segIdx === segments.length - 1;
+    // `**` matches zero or more directories
+    if (seg === '**') {
+      // zero directories: continue matching the rest here
+      walk(dir, rel, segIdx + 1, depth);
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (e.name.startsWith('.')) continue;
+        if (e.isDirectory()) walk(nodePath.join(dir, e.name), rel ? rel + '/' + e.name : e.name, segIdx, depth + 1);
+      }
+      return;
+    }
+    const re = globToRegex(seg);
+    const literalHidden = seg.startsWith('.');
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
-      if (e.name.startsWith('.') && !pat.includes('.*') && !pat.startsWith('.')) continue;
+      if (e.name.startsWith('.') && !literalHidden) continue;
+      if (!re.test(e.name)) continue;
       const r = rel ? rel + '/' + e.name : e.name;
-      if (re.test(r)) results.push(abs ? '/' + r : r);
-      if (e.isDirectory()) walk(nodePath.join(dir, e.name), r, depth + 1);
+      if (last) results.push(abs ? '/' + r : r);
+      else if (e.isDirectory()) walk(nodePath.join(dir, e.name), r, segIdx + 1, depth + 1);
     }
   };
-  walk(root, '', 0);
+  walk(root, '', 0, 0);
   results.sort();
   out.push(...results);
 }
