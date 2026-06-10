@@ -38,7 +38,13 @@ export class Parser {
     // >0 while parsing paren-less command arguments: a `do…end` block there
     // belongs to the outer command, not to a bare identifier argument.
     this.cmdArgDepth = 0;
+    // Names that have appeared as assignment targets / params anywhere so far.
+    // Heuristic mirror of MRI's "is it a local?" used to disambiguate `x -1`
+    // (binary minus on a local) from `foo -1` (command call with -1).
+    this.knownLocals = new Set();
   }
+
+  noteLocal(name) { if (typeof name === 'string') this.knownLocals.add(name); }
 
   // ---- token navigation ---------------------------------------------------
   cur() { return this.toks[this.i]; }
@@ -194,7 +200,7 @@ export class Parser {
   parseLValue() {
     let node;
     const t = this.cur();
-    if (t.type === 'IDENT') { this.advance(); node = N('Ident', { name: t.value }); }
+    if (t.type === 'IDENT') { this.advance(); this.noteLocal(t.value); node = N('Ident', { name: t.value }); }
     else if (t.type === 'IVAR') { this.advance(); node = N('IVar', { name: t.value }); }
     else if (t.type === 'CVAR') { this.advance(); node = N('CVar', { name: t.value }); }
     else if (t.type === 'GVAR') { this.advance(); node = N('GVar', { name: t.value }); }
@@ -250,6 +256,7 @@ export class Parser {
       if (!this.isAssignable(left)) this.error('cannot assign to this expression');
       this.advance();
       this.skipNL();
+      if (left.type === 'Ident') this.noteLocal(left.name);
       const value = this.parseAssign(); // right-associative
       if (t.value === '=') return N('Assign', { target: left, value });
       return N('OpAssign', { target: left, op: t.value.slice(0, -1), value });
@@ -315,6 +322,18 @@ export class Parser {
   parseUnary() {
     const t = this.cur();
     if (t.type === 'OP' && (t.value === '-' || t.value === '+' || t.value === '!' || t.value === '~')) {
+      // Fold a sign directly into a numeric literal (so -4.25.abs == (-4.25).abs
+      // like MRI) — except before **, which binds tighter than unary minus.
+      if ((t.value === '-' || t.value === '+') &&
+          (this.peek().type === 'INT' || this.peek().type === 'FLOAT') &&
+          !this.peek().spaceBefore &&
+          !(this.peek(2) && this.peek(2).type === 'OP' && this.peek(2).value === '**')) {
+        this.advance();
+        const num = this.advance();
+        const v = t.value === '-' ? -num.value : num.value;
+        const lit = num.type === 'INT' ? N('IntLit', { value: v }) : N('FloatLit', { value: v });
+        return this.parsePostfixFrom(lit);
+      }
       this.advance();
       return N('UnaryOp', { op: t.value, operand: this.parseUnary() });
     }
@@ -418,7 +437,7 @@ export class Parser {
   }
 
   // Does an argument list (without parens) start here?
-  commandArgsFollow() {
+  commandArgsFollow(localName) {
     const t = this.cur();
     if (t.type === 'NEWLINE' || t.type === 'EOF') return false;
     if (!t.spaceBefore) return false;
@@ -432,6 +451,7 @@ export class Parser {
       // `foo -1` / `foo *x` / `foo &blk` / `foo :sym` / `foo [1]` / `foo ->{}`
       const next = this.peek();
       if (['-', '+', '*', '**', '&', '::'].includes(t.value)) {
+        if (localName && this.knownLocals.has(localName)) return false; // local var: binary op
         return next && !next.spaceBefore; // unary use: no space after the sign
       }
       if (t.value === '[') return true;
@@ -563,22 +583,27 @@ export class Parser {
       if (this.atOp('*')) {
         this.advance();
         const name = this.atType('IDENT') ? this.advance().value : null;
+        this.noteLocal(name);
         params.push({ kind: 'rest', name });
       } else if (this.atOp('**')) {
         this.advance();
         const name = this.atType('IDENT') ? this.advance().value : null;
+        this.noteLocal(name);
         params.push({ kind: 'kwrest', name });
       } else if (this.atOp('&')) {
         this.advance();
         const name = this.advance().value;
+        this.noteLocal(name);
         params.push({ kind: 'block', name });
       } else if (this.atType('LABEL')) {
         const name = this.advance().value;
+        this.noteLocal(name);
         let def = null;
         if (!this.atOp(',') && !stop() && !this.atType('NEWLINE')) def = this.parseTernary();
         params.push({ kind: 'key', name, default: def });
       } else if (this.atType('IDENT')) {
         const name = this.advance().value;
+        this.noteLocal(name);
         if (this.atOp('=')) {
           this.advance();
           const def = this.parseTernary();
@@ -668,7 +693,7 @@ export class Parser {
     if (this.atOp('(') && !this.cur().spaceBefore) {
       return this.parseCallTail(null, name, false);
     }
-    if (this.commandArgsFollow()) {
+    if (this.commandArgsFollow(name)) {
       return this.parseCallTail(null, name, false);
     }
     // bare identifier: could be a local var or a zero-arg method; also may
@@ -895,6 +920,7 @@ export class Parser {
     this.advance();
     const vars = [this.advance().value];
     while (this.atOp(',')) { this.advance(); vars.push(this.advance().value); }
+    for (const v of vars) this.noteLocal(v);
     this.expectKw('in');
     const iter = this.parseExpression();
     this.acceptDo();
@@ -1040,7 +1066,7 @@ export class Parser {
         classes.push(this.parseExpression());
         while (this.atOp(',')) { this.advance(); classes.push(this.parseExpression()); }
       }
-      if (this.atOp('=>')) { this.advance(); varName = this.advance().value; }
+      if (this.atOp('=>')) { this.advance(); varName = this.advance().value; this.noteLocal(varName); }
       this.acceptThen();
       const rbody = this.parseStatements(() =>
         stop() || this.atKw('rescue') || this.atKw('ensure') || this.atKw('else'));

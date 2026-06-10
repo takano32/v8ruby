@@ -2077,7 +2077,7 @@ function installRegexp() {
   def(RG, 'match?', (s, a) => { const str = jsstr(a[0]); return s.re.test(str); });
   def(RG, 'match', (s, a) => { const str = jsstr(a[0]); const m = str.match(new RegExp(s.re.source, s.re.flags.replace('g', ''))); gvars['$~'] = m ? mkMatchData(m, str) : null; return m ? mkMatchData(m, str) : null; });
   def(RG, '=~', (s, a) => { if (!(a[0] instanceof RString)) return null; const m = a[0].value.match(new RegExp(s.re.source, s.re.flags.replace('g', ''))); return m ? m.index : null; });
-  def(RG, '===', (s, a) => (a[0] instanceof RString || a[0] instanceof RSymbol) && s.re.test(toS(a[0])));
+  def(RG, '===', (s, a) => { if (!(a[0] instanceof RString || a[0] instanceof RSymbol)) { return false; } const str = toS(a[0]); const m = str.match(new RegExp(s.re.source, s.re.flags.replace('g', ''))); gvars['$~'] = m ? mkMatchData(m, str) : null; return !!m; });
   def(RG, 'source', (s) => new RString(s.source));
   def(RG, 'to_s', (s) => new RString(`(?-mix:${s.source})`));
   def(RG, 'inspect', (s) => new RString('/' + s.source + '/' + s.rflags.replace(/[^imx]/g, '')));

@@ -140,6 +140,8 @@ export class Lexer {
       const k = this.peek(1);
       if ('wWiI'.includes(k) && this.isDelim(this.peek(2))) return this.scanWords(k);
       if ('qQ'.includes(k) && this.isDelim(this.peek(2))) return this.scanPercentString(k);
+      if (k === 'r' && this.isDelim(this.peek(2))) return this.scanPercentRegex();
+      if (k === 's' && this.isDelim(this.peek(2))) return this.scanPercentSymbol();
       if (this.isDelim(k)) return this.scanPercentString('Q', 1);
     }
 
@@ -171,6 +173,7 @@ export class Lexer {
     if (c === ':' && this.peek(1) === ':') {
       // scope resolution operator, handled by operator scan
     } else if (c === ':' && (isIdentStart(this.peek(1)) || this.peek(1) === '"' ||
+        this.peek(1) === '@' || this.peek(1) === '$' ||
         '+-*/%<>=!~&|^['.includes(this.peek(1)))) {
       return this.scanSymbol();
     }
@@ -185,6 +188,20 @@ export class Lexer {
   }
 
   scanNumber() {
+    // 0x / 0b / 0o radix literals
+    if (this.peek() === '0' && this.peek(1) !== undefined && 'xXbBoO'.includes(this.peek(1))) {
+      const kind = this.peek(1).toLowerCase();
+      const radix = kind === 'x' ? 16 : kind === 'b' ? 2 : 8;
+      const re = kind === 'x' ? /[0-9a-fA-F_]/ : kind === 'b' ? /[01_]/ : /[0-7_]/;
+      let p = this.pos + 2;
+      let digits = '';
+      while (p < this.src.length && re.test(this.src[p])) { if (this.src[p] !== '_') digits += this.src[p]; p++; }
+      if (digits.length) {
+        this.pos = p;
+        this.push('INT', parseInt(digits, radix));
+        return;
+      }
+    }
     const start = this.pos;
     let isFloat = false;
     while (isDigit(this.peek()) || this.peek() === '_') this.pos++;
@@ -228,6 +245,15 @@ export class Lexer {
       }
       this.pos++;
       this.push('SYMBOL', val);
+      return;
+    }
+    // :@ivar / :@@cvar / :$gvar symbols
+    if (this.peek() === '@' || this.peek() === '$') {
+      const start = this.pos;
+      this.pos++;
+      if (this.peek() === '@') this.pos++;
+      while (isIdentPart(this.peek())) this.pos++;
+      this.push('SYMBOL', this.src.slice(start, this.pos));
       return;
     }
     // operator-method symbols like :+ :== :<=> :[] :[]=
@@ -549,6 +575,47 @@ export class Lexer {
     }
     if (buf.length) words.push(buf);
     this.push('WORDS', { kind: kind.toLowerCase(), words });
+  }
+
+  // %r{pattern}flags — regex literal with custom delimiters.
+  scanPercentRegex() {
+    this.pos += 2; // consume %r
+    const open = this.peek();
+    const close = this.closeDelim(open);
+    this.pos++;
+    let depth = 1;
+    const parts = [];
+    let buf = '';
+    while (this.pos < this.src.length) {
+      const c = this.peek();
+      if (c === '\\') { buf += c + (this.peek(1) ?? ''); this.pos += 2; continue; }
+      if (open !== close && c === open) { depth++; buf += c; this.pos++; continue; }
+      if (c === close) { depth--; if (depth === 0) { this.pos++; break; } buf += c; this.pos++; continue; }
+      if (c === '#' && this.peek(1) === '{') {
+        if (buf.length) { parts.push({ str: buf }); buf = ''; }
+        this.pos += 2;
+        parts.push({ expr: this.scanInterpolation() });
+        continue;
+      }
+      if (c === '\n') this.line++;
+      buf += c; this.pos++;
+    }
+    let flags = '';
+    while (this.peek() !== undefined && /[imxouesn]/.test(this.peek())) { flags += this.peek(); this.pos++; }
+    if (buf.length || parts.length === 0) parts.push({ str: buf });
+    this.push('REGEX', { parts, flags });
+  }
+
+  // %s{sym} — symbol literal.
+  scanPercentSymbol() {
+    this.pos += 2;
+    const open = this.peek();
+    const close = this.closeDelim(open);
+    this.pos++;
+    let buf = '';
+    while (this.pos < this.src.length && this.peek() !== close) { buf += this.peek(); this.pos++; }
+    this.pos++;
+    this.push('SYMBOL', buf);
   }
 
   scanPercentString(kind, skip = 2) {
