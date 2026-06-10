@@ -764,6 +764,16 @@ function tryAutoload(name) {
   return true;
 }
 
+// Module-scoped autoload: `Foo.autoload :Bar, path` registers on Foo, not the
+// global table, so two different modules can autoload the same constant name.
+function tryAutoloadIn(mod, name) {
+  if (!mod || !mod.autoloads || !mod.autoloads.has(name) || !R.__require) return false;
+  const path = mod.autoloads.get(name);
+  mod.autoloads.delete(name);
+  try { R.__require(jsstr(path)); } catch (e) { mod.autoloads.set(name, path); throw e; }
+  return true;
+}
+
 function constGet(name) {
   if (consts.has(name)) return consts.get(name);
   if (tryAutoload(name) && consts.has(name)) return consts.get(name);
@@ -790,15 +800,27 @@ function resolvePath(path) {
 // "Foo::Bar" paths), then the defining class's superclass chain, then globals,
 // then autoload.
 function constResolve(nesting, cls, name) {
-  for (let i = nesting.length - 1; i >= 0; i--) {
-    const mod = resolvePath(nesting[i]);
-    if (mod && mod.constants.has(name)) return mod.constants.get(name);
-  }
-  let c = cls instanceof RClass ? cls : null;
-  while (c) {
-    if (c.constants.has(name)) return c.constants.get(name);
-    c = c.superclass;
-  }
+  const search = () => {
+    for (let i = nesting.length - 1; i >= 0; i--) {
+      const mod = resolvePath(nesting[i]);
+      if (mod) {
+        if (mod.constants.has(name)) return mod.constants.get(name);
+        if (tryAutoloadIn(mod, name) && mod.constants.has(name)) return mod.constants.get(name);
+      }
+    }
+    let c = cls instanceof RClass ? cls : null;
+    while (c) {
+      if (c.constants.has(name)) return c.constants.get(name);
+      if (tryAutoloadIn(c, name) && c.constants.has(name)) return c.constants.get(name);
+      c = c.superclass;
+    }
+    if (consts.has(name)) return consts.get(name);
+    return undefined;
+  };
+  let v = search();
+  if (v !== undefined) return v;
+  // A pending global autoload (top-level `autoload`) may define it.
+  if (tryAutoload(name)) { v = search(); if (v !== undefined) return v; }
   return constGet(name);
 }
 // Back-compat single-arg form used by a few runtime call sites.
@@ -808,11 +830,11 @@ function constLookup(cls, name) {
 function constDefined(nesting, cls, name) {
   for (let i = nesting.length - 1; i >= 0; i--) {
     const mod = resolvePath(nesting[i]);
-    if (mod && mod.constants.has(name)) return true;
+    if (mod && (mod.constants.has(name) || (mod.autoloads && mod.autoloads.has(name)))) return true;
   }
   let c = cls instanceof RClass ? cls : null;
   while (c) {
-    if (c.constants.has(name)) return true;
+    if (c.constants.has(name) || (c.autoloads && c.autoloads.has(name))) return true;
     c = c.superclass;
   }
   return consts.has(name) || autoloads.has(name);
@@ -822,6 +844,7 @@ function constGetFrom(base, name) {
     let c = base instanceof RClass ? base : null;
     while (c) {
       if (c.constants.has(name)) return c.constants.get(name);
+      if (tryAutoloadIn(c, name) && c.constants.has(name)) return c.constants.get(name);
       c = c.superclass;
     }
     if (consts.has(name)) return consts.get(name);
@@ -829,7 +852,7 @@ function constGetFrom(base, name) {
   };
   let v = search();
   if (v !== undefined) return v;
-  // Autoload may define the constant in `base` (nested module) or globally.
+  // A pending global autoload may define the constant.
   if (tryAutoload(name)) { v = search(); if (v !== undefined) return v; }
   raiseError(NameErrorC, `uninitialized constant ${base instanceof RClass && base.name ? base.name + '::' : ''}${name}`);
 }
@@ -847,7 +870,9 @@ function splitQualified(name, outer) {
 function defineClass(name, superExpr, builder, outer) {
   [name, outer] = splitQualified(name, outer);
   if (!outer) { const d = currentDefinee(); if (d && d !== ObjectC) outer = d; }
-  let cls = (outer && outer.constants.has(name)) ? outer.constants.get(name)
+  // When nested in an outer module/class, a `class Name` only reopens
+  // outer::Name — never a same-named top-level constant.
+  let cls = outer ? (outer.constants.has(name) ? outer.constants.get(name) : null)
     : (consts.has(name) ? consts.get(name) : null);
   if (!cls) {
     cls = new RClass(name, superExpr || ObjectC);
@@ -870,7 +895,8 @@ function defineClass(name, superExpr, builder, outer) {
 function defineModule(name, builder, outer) {
   [name, outer] = splitQualified(name, outer);
   if (!outer) { const d = currentDefinee(); if (d && d !== ObjectC) outer = d; }
-  let mod = (outer && outer.constants.has(name)) ? outer.constants.get(name)
+  // Nested `module Name` only reopens outer::Name, never a top-level same-named const.
+  let mod = outer ? (outer.constants.has(name) ? outer.constants.get(name) : null)
     : (consts.has(name) ? consts.get(name) : null);
   if (!mod) {
     mod = new RClass(name, null, true);
@@ -2055,9 +2081,19 @@ function installModuleClass() {
   def(ModuleC, 'protected_instance_methods', () => []);
   def(ModuleC, 'instance_method', (s, a) => makeProc((args) => send(args[0], a[0] instanceof RSymbol ? a[0].name : jsstr(a[0]), args.slice(1))));
   def(ModuleC, 'method_defined?', (s, a) => !!findMethod(s, a[0] instanceof RSymbol ? a[0].name : jsstr(a[0])));
-  def(ModuleC, 'const_get', (s, a) => { const n = a[0] instanceof RSymbol ? a[0].name : jsstr(a[0]); return s.constants.has(n) ? s.constants.get(n) : constGet(n); });
+  def(ModuleC, 'const_get', (s, a) => {
+    const n = a[0] instanceof RSymbol ? a[0].name : jsstr(a[0]);
+    // qualified name: Foo.const_get("Bar::Baz")
+    if (n.includes('::')) { let base = s; for (const p of n.split('::')) { if (p === '') { base = ObjectC; continue; } base = constGetFrom(base, p); } return base; }
+    return constGetFrom(s, n);
+  });
   def(ModuleC, 'const_set', (s, a) => { const n = a[0] instanceof RSymbol ? a[0].name : jsstr(a[0]); s.constants.set(n, a[1]); consts.set(n, a[1]); return a[1]; });
-  def(ModuleC, 'const_defined?', (s, a) => { const n = a[0] instanceof RSymbol ? a[0].name : jsstr(a[0]); return s.constants.has(n) || consts.has(n); });
+  def(ModuleC, 'const_defined?', (s, a) => {
+    const n = a[0] instanceof RSymbol ? a[0].name : jsstr(a[0]);
+    let c = s instanceof RClass ? s : null;
+    while (c) { if (c.constants.has(n) || (c.autoloads && c.autoloads.has(n))) return true; c = c.superclass; }
+    return consts.has(n) || autoloads.has(n);
+  });
   def(ModuleC, 'include', (s, a) => { for (const m of a) includeModule(s, m); return s; });
   def(ModuleC, 'prepend', (s, a) => { for (const m of a) includeModule(s, m); return s; });
   def(ModuleC, 'include?', (s, a) => s.includes.includes(a[0]));
@@ -2087,7 +2123,7 @@ function installModuleClass() {
   def(ModuleC, '<=', (s, a) => s === a[0] || truthy(send(s, '<', [a[0]])));
   def(ModuleC, '>', (s, a) => a[0] instanceof RClass && truthy(send(a[0], '<', [s])));
   def(ModuleC, '>=', (s, a) => s === a[0] || truthy(send(s, '>', [a[0]])));
-  def(ModuleC, 'autoload', (s, a) => { autoloads.set(a[0] instanceof RSymbol ? a[0].name : jsstr(a[0]), a[1]); return null; });
+  def(ModuleC, 'autoload', (s, a) => { if (!s.autoloads) s.autoloads = new Map(); s.autoloads.set(a[0] instanceof RSymbol ? a[0].name : jsstr(a[0]), a[1]); return null; });
   def(ModuleC, 'private_class_method', (s) => s);
   def(ModuleC, 'public_class_method', (s) => s);
   def(ModuleC, 'extended', () => null);
@@ -2105,7 +2141,16 @@ function installModuleClass() {
   def(ClassC, 'superclass', (s) => s.superclass);
   def(ClassC, 'new', (s, a, blk) => classNew(s, a, blk));
   def(ClassC, 'allocate', (s) => new RObject(s));
-  sdef(ClassC, 'new', (cls, a, blk) => { const c = new RClass(null, a[0] || ObjectC); if (blk) blk.fn([c], c); return c; });
+  sdef(ClassC, 'new', (cls, a, blk) => {
+    const c = new RClass(null, a[0] || ObjectC);
+    const sup = a[0] || ObjectC;
+    const inh = findSingletonMethod(sup, 'inherited');
+    if (inh) inh(sup, [c]);
+    // Run the block with the new class as the current definee AND self, so
+    // `def`/attr_reader/include inside it target the new (anonymous) class.
+    if (blk) { pushDefinee(c); try { blk.fn([c], c); } finally { popDefinee(); } }
+    return c;
+  });
 }
 
 // ---- Exception ------------------------------------------------------------
