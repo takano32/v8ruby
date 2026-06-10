@@ -199,8 +199,12 @@ export function executeSource(src, path) {
   }
 }
 
+// Native extensions (.so/.bundle/.dll) can't be loaded by a JS runtime.
+const NATIVE_EXT = /\.(so|bundle|dll|dylib)$/;
+
 // ---- require family -------------------------------------------------------
 export function requireFeature(name) {
+  if (NATIVE_EXT.test(name)) raiseLoadError(`cannot load such file -- ${name}`);
   let abs = resolveFeature(name);
   if (!abs && tryActivateFor(name)) abs = resolveFeature(name);
   if (!abs) raiseLoadError(`cannot load such file -- ${name}`);

@@ -137,12 +137,20 @@ export class Lexer {
 
     // %w[...] %i[...] word/symbol array literals (and %q/%Q strings).
     if (c === '%' && (this.prevAllowsValue() || this.spaceBefore)) {
-      const k = this.peek(1);
-      if ('wWiI'.includes(k) && this.isDelim(this.peek(2))) return this.scanWords(k);
-      if ('qQ'.includes(k) && this.isDelim(this.peek(2))) return this.scanPercentString(k);
-      if (k === 'r' && this.isDelim(this.peek(2))) return this.scanPercentRegex();
-      if (k === 's' && this.isDelim(this.peek(2))) return this.scanPercentSymbol();
-      if (this.isDelim(k)) return this.scanPercentString('Q', 1);
+      // …but after `def` or `.` a `%` is an operator-method name, not a literal
+      let j = this.tokens.length - 1;
+      while (j >= 0 && this.tokens[j].type === 'NEWLINE') j--;
+      const prev = j >= 0 ? this.tokens[j] : null;
+      const isDefName = prev && ((prev.type === 'KEYWORD' && prev.value === 'def') ||
+        (prev.type === 'OP' && prev.value === '.'));
+      if (!isDefName) {
+        const k = this.peek(1);
+        if ('wWiI'.includes(k) && this.isDelim(this.peek(2))) return this.scanWords(k);
+        if ('qQ'.includes(k) && this.isDelim(this.peek(2))) return this.scanPercentString(k);
+        if (k === 'r' && this.isDelim(this.peek(2))) return this.scanPercentRegex();
+        if (k === 's' && this.isDelim(this.peek(2))) return this.scanPercentSymbol();
+        if (this.isDelim(k)) return this.scanPercentString('Q', 1);
+      }
     }
 
     // Regex literal /pattern/flags (vs division — use value context + spacing).

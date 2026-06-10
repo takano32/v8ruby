@@ -414,6 +414,10 @@ export class Parser {
     if (t.type === 'OP') {
       this.advance();
       if (t.value === '[' ) { this.expectOp(']'); if (this.atOp('=')) { this.advance(); return '[]='; } return '[]'; }
+      // unary method names: -@ and +@ (lexed as two tokens: `-` then bare `@` IVAR)
+      if ((t.value === '-' || t.value === '+') && this.cur().type === 'IVAR' && this.cur().value === '@' && !this.cur().spaceBefore) {
+        this.advance(); return t.value + '@';
+      }
       return t.value;
     }
     this.error('expected method name');
@@ -954,8 +958,8 @@ export class Parser {
   }
 
   parseWhenCond() {
-    if (this.atOp('*')) { this.advance(); return N('Splat', { value: this.parseTernary() }); }
-    return this.parseTernary();
+    if (this.atOp('*')) { this.advance(); return N('Splat', { value: this.parseAssign() }); }
+    return this.parseAssign();
   }
 
   parseDef() {

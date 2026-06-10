@@ -47,6 +47,12 @@ class RObject {
 }
 
 // Translate a Ruby regex source+flags to a JS RegExp.
+const POSIX_CLASS = {
+  alpha: 'A-Za-z', digit: '\\d', alnum: 'A-Za-z\\d', space: '\\s',
+  upper: 'A-Z', lower: 'a-z', xdigit: '0-9A-Fa-f', punct: '!-/:-@\\[-`{-~',
+  blank: ' \\t', cntrl: '\\x00-\\x1f\\x7f', print: '\\x20-\\x7e', graph: '\\x21-\\x7e',
+  word: '\\w',
+};
 function convertRegexSource(source, rflags) {
   let flags = '';
   if (rflags.includes('i')) flags += 'i';
@@ -54,7 +60,14 @@ function convertRegexSource(source, rflags) {
   let src = source
     .replace(/\\A/g, '^').replace(/\\z/g, '$').replace(/\\Z/g, '$')
     .replace(/\\h/g, '[0-9a-fA-F]').replace(/\\H/g, '[^0-9a-fA-F]')
-    .replace(/\\e/g, '\\x1b'); // JS regexes have no \e escape
+    .replace(/\\e/g, '\\x1b') // JS regexes have no \e escape
+    // POSIX character classes: [[:alpha:]] → [A-Za-z], [^[:digit:]] → [^\d]
+    .replace(/\[(\^?)\[:(\w+):\]\]/g, (_, neg, cls) => {
+      const exp = POSIX_CLASS[cls];
+      return exp ? `[${neg}${exp}]` : `[${neg}[:${cls}:]]`;
+    })
+    // POSIX inside a larger bracket expression: [a-z[:upper:]] → [a-zA-Z]
+    .replace(/\[:(\w+):\]/g, (m, cls) => POSIX_CLASS[cls] || m);
   if (rflags.includes('x')) {
     src = src.replace(/\\?\s|#.*$/gm, (m) => (m[0] === '\\' ? m : ''));
   }
@@ -866,14 +879,15 @@ function openSingleton(obj, builder) {
   return null;
 }
 
-function defineAttr(cls, kind, names) {
+function defineAttr(cls, kind, names, singleton = false) {
+  const table = singleton ? cls.smethods : cls.methods;
   for (const name of names) {
     const iv = '@' + name;
     if (kind === 'attr_reader' || kind === 'attr_accessor') {
-      cls.methods.set(name, (self) => (self.ivars[iv] ?? null));
+      table.set(name, (self) => (self.ivars[iv] ?? null));
     }
     if (kind === 'attr_writer' || kind === 'attr_accessor') {
-      cls.methods.set(name + '=', (self, args) => { self.ivars[iv] = args[0]; return args[0]; });
+      table.set(name + '=', (self, args) => { self.ivars[iv] = args[0]; return args[0]; });
     }
   }
   return null;
@@ -1443,7 +1457,16 @@ function strSplit(str, a) {
 function strSub(str, a, blk, global) {
   const pat = a[0];
   const re = jsRe(pat, global);
-  if (blk) return str.replace(re, (m) => toS(callBlock(blk, [new RString(m)])));
+  if (blk) return str.replace(re, (...args) => {
+    // args: (match, p1, p2, ..., offset, string [, groups])
+    const hasNamed = typeof args[args.length - 1] === 'object';
+    const end = args.length - (hasNamed ? 3 : 2);
+    const m = args.slice(0, end);
+    m.index = args[end];
+    m.input = str;
+    gvars['$~'] = mkMatchData(m, str);
+    return toS(callBlock(blk, [new RString(args[0])]));
+  });
   const rep = a[1];
   if (rep instanceof RHash) return str.replace(re, (m) => { const val = rep.get(new RString(m)); return val == null ? '' : toS(val); });
   const repStr = jsstr(rep).replace(/\\(\d)/g, '$$$1');
@@ -1971,6 +1994,11 @@ function installModuleClass() {
   def(ModuleC, '===', (s, a) => isA(a[0], s));
   def(ModuleC, '==', (s, a) => s === a[0]);
   def(ModuleC, 'instance_methods', (s) => { const out = new Set(); let c = s; while (c) { for (const k of c.methods.keys()) out.add(k); c = c.superclass; } return [...out].map((n) => new RSymbol(n)); });
+  // v8ruby does not track method visibility — all methods are effectively public,
+  // so the private/protected lists are empty and public mirrors instance_methods.
+  def(ModuleC, 'public_instance_methods', ModuleC.methods.get('instance_methods'));
+  def(ModuleC, 'private_instance_methods', () => []);
+  def(ModuleC, 'protected_instance_methods', () => []);
   def(ModuleC, 'instance_method', (s, a) => makeProc((args) => send(args[0], a[0] instanceof RSymbol ? a[0].name : jsstr(a[0]), args.slice(1))));
   def(ModuleC, 'method_defined?', (s, a) => !!findMethod(s, a[0] instanceof RSymbol ? a[0].name : jsstr(a[0])));
   def(ModuleC, 'const_get', (s, a) => { const n = a[0] instanceof RSymbol ? a[0].name : jsstr(a[0]); return s.constants.has(n) ? s.constants.get(n) : constGet(n); });
@@ -2109,6 +2137,13 @@ function installRegexp() {
   sdef(RG, 'new', (cls, a) => new RRegexp(a[0] instanceof RRegexp ? a[0].source : jsstr(a[0]), a[1] != null ? jsstr(a[1]) : ''));
   sdef(RG, 'escape', (cls, a) => new RString(jsstr(a[0]).replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&')));
   sdef(RG, 'quote', RG.smethods.get('escape'));
+  sdef(RG, 'union', (cls, a) => {
+    // Regexp.union(a, b, ...) or Regexp.union([a, b, ...])
+    let parts = a.length === 1 && Array.isArray(a[0]) ? a[0] : a;
+    if (parts.length === 0) return new RRegexp('(?!)', '');
+    const srcs = parts.map((p) => p instanceof RRegexp ? p.source : jsstr(p).replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&'));
+    return new RRegexp(srcs.join('|'), '');
+  });
   def(RG, 'match?', (s, a) => { const str = jsstr(a[0]); return s.re.test(str); });
   def(RG, 'match', (s, a) => { const str = jsstr(a[0]); const m = str.match(new RegExp(s.re.source, s.re.flags.replace('g', ''))); gvars['$~'] = m ? mkMatchData(m, str) : null; return m ? mkMatchData(m, str) : null; });
   def(RG, '=~', (s, a) => { if (!(a[0] instanceof RString)) return null; const m = a[0].value.match(new RegExp(s.re.source, s.re.flags.replace('g', ''))); return m ? m.index : null; });

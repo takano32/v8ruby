@@ -772,7 +772,7 @@ export class Compiler {
       return `R.aliasSingleton(${target}, ${this.q(node.newName)}, ${this.q(node.oldName)});`;
     }
     if (node.type === 'Attr') {
-      return `R.defineAttr(${target}, ${this.q(node.kind)}, ${JSON.stringify(node.names)});`;
+      return `R.defineAttr(${target}, ${this.q(node.kind)}, ${JSON.stringify(node.names)}, true);`;
     }
     return this.genStmt(node);
   }
@@ -804,6 +804,16 @@ export class Compiler {
   genParamBinding(params, isBlock) {
     if (!params || params.length === 0) return '';
     const lines = [];
+
+    // Deduplicate params named `_` — each gets a unique temp name so `let` doesn't collide.
+    const usedParamVars = new Set();
+    params = params.map((p) => {
+      if (!p.name) return p;
+      let v = this.local(p.name);
+      if (usedParamVars.has(v)) { p = { ...p, name: '_$' + (++this.tmp) }; }
+      else { usedParamVars.add(v); }
+      return p;
+    });
 
     const positional = params.filter((p) => ['req', 'opt', 'rest', 'destructure'].includes(p.kind));
     const keys = params.filter((p) => p.kind === 'key');
