@@ -803,15 +803,12 @@ function constResolve(nesting, cls, name) {
   const search = () => {
     for (let i = nesting.length - 1; i >= 0; i--) {
       const mod = resolvePath(nesting[i]);
-      if (mod) {
-        if (mod.constants.has(name)) return mod.constants.get(name);
-        if (tryAutoloadIn(mod, name) && mod.constants.has(name)) return mod.constants.get(name);
-      }
+      if (mod) { const v = constInModule(mod, name); if (v !== undefined) return v; }
     }
     let c = cls instanceof RClass ? cls : null;
     while (c) {
-      if (c.constants.has(name)) return c.constants.get(name);
-      if (tryAutoloadIn(c, name) && c.constants.has(name)) return c.constants.get(name);
+      const v = constInModule(c, name);
+      if (v !== undefined) return v;
       c = c.superclass;
     }
     if (consts.has(name)) return consts.get(name);
@@ -839,12 +836,23 @@ function constDefined(nesting, cls, name) {
   }
   return consts.has(name) || autoloads.has(name);
 }
+// Look up a constant in a module and its included modules (recursively).
+function constInModule(mod, name) {
+  if (mod.constants.has(name)) return mod.constants.get(name);
+  if (tryAutoloadIn(mod, name) && mod.constants.has(name)) return mod.constants.get(name);
+  for (let i = mod.includes.length - 1; i >= 0; i--) {
+    const v = constInModule(mod.includes[i], name);
+    if (v !== undefined) return v;
+  }
+  return undefined;
+}
 function constGetFrom(base, name) {
   const search = () => {
+    // qualified A::B searches A, A's included modules, then A's superclasses
     let c = base instanceof RClass ? base : null;
     while (c) {
-      if (c.constants.has(name)) return c.constants.get(name);
-      if (tryAutoloadIn(c, name) && c.constants.has(name)) return c.constants.get(name);
+      const v = constInModule(c, name);
+      if (v !== undefined) return v;
       c = c.superclass;
     }
     if (consts.has(name)) return consts.get(name);
@@ -1441,6 +1449,8 @@ function installString() {
   def(S, 'lstrip', (s) => new RString(s.value.replace(/^\s+/, '')));
   def(S, 'rstrip', (s) => new RString(s.value.replace(/\s+$/, '')));
   def(S, 'strip!', (s) => { checkFrozen(s); const o = s.value; s.value = s.value.trim(); return o === s.value ? null : s; });
+  def(S, 'lstrip!', (s) => { checkFrozen(s); const o = s.value; s.value = s.value.replace(/^\s+/, ''); return o === s.value ? null : s; });
+  def(S, 'rstrip!', (s) => { checkFrozen(s); const o = s.value; s.value = s.value.replace(/\s+$/, ''); return o === s.value ? null : s; });
   def(S, 'chomp', (s, a) => new RString(a[0] ? (s.value.endsWith(jsstr(a[0])) ? s.value.slice(0, -jsstr(a[0]).length) : s.value) : s.value.replace(/\r?\n$/, '')));
   def(S, 'chomp!', (s, a) => { checkFrozen(s); const o = s.value; s.value = jsstr(send(s, 'chomp', a)); return o === s.value ? null : s; });
   def(S, 'chop', (s) => new RString(s.value.replace(/(\r\n|.)$/, '')));
@@ -1508,6 +1518,12 @@ function installString() {
   def(S, 'each_with_index', (s, a, blk) => { let i = 0; for (const c of s.value) safeYield(blk, [new RString(c), i++]); return s; });
   def(S, 'encoding', (s) => new RString('UTF-8'));
   def(S, 'force_encoding', (s) => s);
+  def(S, 'valid_encoding?', () => true);
+  def(S, 'ascii_only?', (s) => /^[\x00-\x7f]*$/.test(s.value));
+  def(S, 'encode', (s) => new RString(s.value));
+  def(S, 'b', (s) => new RString(s.value));
+  def(S, 'scrub', (s, a) => new RString(s.value));
+  def(S, 'unicode_normalize', (s) => new RString(s.value.normalize()));
   def(S, 'unpack', () => []);
   def(S, 'b', (s) => s);
 }
@@ -1870,6 +1886,8 @@ function installHash() {
   def(H, 'fetch_values', (s, a) => a.map((k) => send(s, 'fetch', [k])));
   def(H, 'default', (s) => s.defaultValue);
   def(H, 'default=', (s, a) => { s.defaultValue = a[0]; return a[0]; });
+  def(H, 'default_proc', (s) => s.defaultProc || null);
+  def(H, 'default_proc=', (s, a) => { s.defaultProc = a[0]; return a[0]; });
   def(H, 'to_proc', (s) => makeProc((args) => send(s, '[]', [args[0]])));
   def(H, '==', (s, a) => rbEqual(s, a[0]));
   def(H, 'hash', (s) => s.size);
