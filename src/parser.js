@@ -662,6 +662,7 @@ export class Parser {
         return this.makeString(parts);
       }
       case 'SYMBOL': this.advance(); return N('SymLit', { name: t.value });
+      case 'DSYMBOL': this.advance(); return N('DSym', { str: this.makeString(t.value) });
       case 'REGEX': {
         this.advance();
         const parts = t.value.parts.map((p) =>

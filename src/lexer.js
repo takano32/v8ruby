@@ -181,7 +181,7 @@ export class Lexer {
     if (c === ':' && this.peek(1) === ':') {
       // scope resolution operator, handled by operator scan
     } else if (c === ':' && (isIdentStart(this.peek(1)) || this.peek(1) === '"' ||
-        this.peek(1) === '@' || this.peek(1) === '$' ||
+        this.peek(1) === "'" || this.peek(1) === '@' || this.peek(1) === '$' ||
         '+-*/%<>=!~&|^['.includes(this.peek(1)))) {
       return this.scanSymbol();
     }
@@ -261,15 +261,16 @@ export class Lexer {
   scanSymbol() {
     this.pos++; // consume ':'
     if (this.peek() === '"') {
-      // :"interpolated-ish" — treat as plain string symbol (no interpolation).
-      this.pos++;
-      let val = '';
-      while (this.pos < this.src.length && this.peek() !== '"') {
-        val += this.peek();
-        this.pos++;
-      }
-      this.pos++;
-      this.push('SYMBOL', val);
+      // :"name" / :"convert_#{k}" — symbol from a double-quoted (interpolated) string.
+      const parts = this.scanQuotedParts('"', true);
+      if (parts.length === 1 && 'str' in parts[0]) { this.push('SYMBOL', parts[0].str); }
+      else { this.push('DSYMBOL', parts); }
+      return;
+    }
+    if (this.peek() === "'") {
+      // :'name' — symbol from a single-quoted (non-interpolated) string.
+      const parts = this.scanQuotedParts("'", false);
+      this.push('SYMBOL', parts.map((p) => p.str || '').join(''));
       return;
     }
     // :@ivar / :@@cvar / :$gvar symbols
@@ -310,10 +311,10 @@ export class Lexer {
       text = 'defined?';
     }
 
-    // `foo:` keyword-argument / hash-shorthand label.
-    if (this.peek() === ':' && this.peek(1) !== ':' &&
-        KEYWORDS.has(text) === false) {
-      // Look like a label only when used as `key:` (followed by space/value).
+    // `foo:` keyword-argument / hash-shorthand label. Ruby keywords are allowed
+    // as labels (`{class: 1}`, `foo(if: true)`) — only the `::` scope operator
+    // and a trailing space before `:` exclude it.
+    if (this.peek() === ':' && this.peek(1) !== ':') {
       // We emit LABEL and consume the colon.
       this.pos++;
       this.push('LABEL', text);
@@ -330,6 +331,12 @@ export class Lexer {
   }
 
   scanString(quote, interpolate) {
+    this.push('STRING', this.scanQuotedParts(quote, interpolate));
+  }
+
+  // Scan a quoted literal body (the opening quote is at this.pos) and return its
+  // parts ({str} / {expr}). Shared by string and dynamic-symbol scanning.
+  scanQuotedParts(quote, interpolate) {
     this.pos++; // consume opening quote
     const parts = [];
     let buf = '';
@@ -368,7 +375,7 @@ export class Lexer {
     if (this.peek() !== quote) this.error('unterminated string literal');
     this.pos++; // consume closing quote
     if (buf.length || parts.length === 0) parts.push({ str: buf });
-    this.push('STRING', parts);
+    return parts;
   }
 
   // Consume a backslash escape starting at this.pos (which points at `\`),

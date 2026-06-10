@@ -54,13 +54,24 @@ const POSIX_CLASS = {
   word: '\\w',
 };
 function convertRegexSource(source, rflags) {
-  let flags = '';
+  // Ruby's ^ and $ are ALWAYS line-anchored (like JS /m); \A and \z are the
+  // string anchors. So always compile with JS /m, and translate \A/\z to the
+  // string-anchored forms that survive /m.
+  let flags = 'm';
   if (rflags.includes('i')) flags += 'i';
   if (rflags.includes('m')) flags += 's'; // Ruby /m = dot matches newline = JS /s
   let src = source
-    .replace(/\\A/g, '^').replace(/\\z/g, '$').replace(/\\Z/g, '$')
+    // \A → start of string (not line): (?<![\s\S]) ; \z → end of string: (?![\s\S])
+    .replace(/\\A/g, '(?<![\\s\\S])').replace(/\\z/g, '(?![\\s\\S])')
+    .replace(/\\Z/g, '(?![\\s\\S])')
     .replace(/\\h/g, '[0-9a-fA-F]').replace(/\\H/g, '[^0-9a-fA-F]')
     .replace(/\\e/g, '\\x1b') // JS regexes have no \e escape
+    // Atomic groups (?>...) → non-capturing (?:...) (JS has no atomic groups;
+    // the match set is the same, only backtracking behavior differs).
+    .replace(/\(\?>/g, '(?:')
+    // Possessive quantifiers X*+ X++ X?+ X{n,m}+ → greedy (JS has no possessive)
+    .replace(/([*+?])\+/g, '$1')
+    .replace(/(\{\d+(?:,\d*)?\})\+/g, '$1')
     // POSIX character classes: [[:alpha:]] → [A-Za-z], [^[:digit:]] → [^\d]
     .replace(/\[(\^?)\[:(\w+):\]\]/g, (_, neg, cls) => {
       const exp = POSIX_CLASS[cls];
@@ -484,7 +495,14 @@ function inspect(v) {
   if (typeof v === 'number') return String(v);
   if (v instanceof RFloat) return floatToS(v.value);
   if (v instanceof RString) return strInspect(v.value);
-  if (v instanceof RSymbol) return ':' + v.name;
+  if (v instanceof RSymbol) {
+    // bare identifiers, operators, and `name=`/`name?`/`name!` print unquoted;
+    // anything else (spaces, etc.) is quoted like a string
+    const n = v.name;
+    const bare = /^[a-zA-Z_]\w*[?!=]?$/.test(n) || /^@{0,2}[a-zA-Z_]\w*$/.test(n) ||
+      /^\$[a-zA-Z_]\w*$/.test(n) || /^(\[\]=?|[+\-*/%<>=!~&|^]+|<=>|===?|!=|<=|>=|<<|>>|\*\*)$/.test(n);
+    return bare ? ':' + n : ':' + strInspect(n);
+  }
   if (Array.isArray(v)) return '[' + v.map(inspect).join(', ') + ']';
   if (v instanceof RHash) {
     const parts = [];
@@ -1485,9 +1503,12 @@ function installString() {
   def(S, 'sub!', (s, a, blk) => { checkFrozen(s); const o = s.value; s.value = strSub(s.value, a, blk, false); return o === s.value ? null : s; });
   def(S, 'gsub!', (s, a, blk) => { checkFrozen(s); const o = s.value; s.value = strSub(s.value, a, blk, true); return o === s.value ? null : s; });
   def(S, 'tr', (s, a) => new RString(strTr(s.value, jsstr(a[0]), jsstr(a[1]))));
+  def(S, 'tr!', (s, a) => { checkFrozen(s); const o = s.value; s.value = strTr(s.value, jsstr(a[0]), jsstr(a[1])); return o === s.value ? null : s; });
   def(S, 'delete', (s, a) => new RString(strTr(s.value, jsstr(a[0]), '')));
+  def(S, 'delete!', (s, a) => { checkFrozen(s); const o = s.value; s.value = strTr(s.value, jsstr(a[0]), ''); return o === s.value ? null : s; });
   def(S, 'count', (s, a) => { const set = expandTr(jsstr(a[0])); let n = 0; for (const c of s.value) if (set.includes(c)) n++; return n; });
   def(S, 'squeeze', (s) => new RString(s.value.replace(/(.)\1+/g, '$1')));
+  def(S, 'squeeze!', (s) => { checkFrozen(s); const o = s.value; s.value = s.value.replace(/(.)\1+/g, '$1'); return o === s.value ? null : s; });
   def(S, 'to_i', (s, a) => { const base = a && a[0] != null ? numVal(a[0]) : 10; const re = base === 16 ? /^[-+]?[0-9a-fA-F]+/ : base === 2 ? /^[-+]?[01]+/ : base === 8 ? /^[-+]?[0-7]+/ : /^[-+]?\d+/; const m = s.value.trim().match(re); const n = m ? parseInt(m[0], base) : 0; return Number.isNaN(n) ? 0 : n; });
   def(S, 'to_f', (s) => { const m = s.value.trim().match(/^[-+]?\d*\.?\d+([eE][-+]?\d+)?/); return mkfloat(m ? parseFloat(m[0]) : 0); });
   def(S, 'to_s', (s) => s);
@@ -1565,12 +1586,18 @@ function strSub(str, a, blk, global) {
 }
 function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 function strTr(str, from, to) {
-  const fset = expandTr(from); const tset = expandTr(to);
+  // A leading `^` negates the from-set (matches every char NOT listed).
+  const negated = from.length > 1 && from[0] === '^';
+  const fset = expandTr(negated ? from.slice(1) : from);
+  const tset = expandTr(to);
   let out = '';
   for (const c of str) {
-    const i = fset.indexOf(c);
-    if (i >= 0) { if (tset.length) out += tset[Math.min(i, tset.length - 1)]; }
-    else out += c;
+    const inSet = fset.indexOf(c) >= 0;
+    const match = negated ? !inSet : inSet;
+    if (match) {
+      // negated: all matched chars map to the last replacement char
+      if (tset.length) out += negated ? tset[tset.length - 1] : tset[Math.min(fset.indexOf(c), tset.length - 1)];
+    } else out += c;
   }
   return out;
 }
@@ -1618,7 +1645,7 @@ function installSymbol() {
   def(Y, 'name', (s) => new RString(s.name));
   def(Y, 'to_sym', (s) => s);
   def(Y, 'to_proc', (s) => makeProc((args) => send(args[0], s.name, args.slice(1))));
-  def(Y, 'inspect', (s) => new RString(':' + s.name));
+  def(Y, 'inspect', (s) => new RString(inspect(s)));
   def(Y, '==', (s, a) => a[0] instanceof RSymbol && s.name === a[0].name);
   def(Y, '<=>', (s, a) => (a[0] instanceof RSymbol ? (s.name < a[0].name ? -1 : s.name > a[0].name ? 1 : 0) : null));
   def(Y, 'length', (s) => s.name.length);

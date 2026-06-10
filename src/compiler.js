@@ -319,6 +319,7 @@ export class Compiler {
       case 'FloatLit': return `R.float(${node.value})`;
       case 'StrLit': return this.genStr(node);
       case 'SymLit': return `R.sym(${this.q(node.name)})`;
+      case 'DSym': return `R.sym(R.interp(${this.gen(node.str)}))`;
       case 'RegexLit': return this.genRegex(node);
       case 'NilLit': return 'null';
       case 'BoolLit': return node.value ? 'true' : 'false';
