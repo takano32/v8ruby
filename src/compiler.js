@@ -647,6 +647,9 @@ export class Compiler {
       core += ` catch (${errv}) {\n`;
       core += `if (${errv} instanceof R.ReturnError || ${errv} instanceof R.BreakError || ${errv} instanceof R.NextError || ${errv} instanceof R.RetryError || ${errv} instanceof R.ThrowSignal) throw ${errv};\n`;
       core += `const $exc = (${errv} instanceof R.RubyError) ? ${errv}.rubyObj : R.wrapJsError(${errv});\n`;
+      // Track $! (the exception being handled) so a bare `raise` re-raises it.
+      core += `const $prevExc = R.gvarGet("$!"); R.gvarSet("$!", $exc);\n`;
+      core += `try {\n`;
       let first = true;
       for (const r of node.rescues) {
         let cond;
@@ -661,6 +664,7 @@ export class Compiler {
         first = false;
       }
       core += `else { throw ${errv}; }\n`;
+      core += `} finally { R.gvarSet("$!", $prevExc); }\n`;
       core += '}';
     }
 

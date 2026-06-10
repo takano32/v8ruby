@@ -67,7 +67,15 @@ function convertRegexSource(source, rflags) {
       return exp ? `[${neg}${exp}]` : `[${neg}[:${cls}:]]`;
     })
     // POSIX inside a larger bracket expression: [a-z[:upper:]] → [a-zA-Z]
-    .replace(/\[:(\w+):\]/g, (m, cls) => POSIX_CLASS[cls] || m);
+    .replace(/\[:(\w+):\]/g, (m, cls) => POSIX_CLASS[cls] || m)
+    // Ruby inline flag groups (?on-off:...) — map Ruby flags to JS (m→s, drop x).
+    // JS supports inline i and s; m (multiline) and x (extended) are not flags here.
+    .replace(/\(\?([mix]*)(?:-([mix]*))?:/g, (whole, on, off) => {
+      const map = (fs) => (fs || '').replace(/m/g, 's').replace(/x/g, '');
+      const jsOn = map(on), jsOff = map(off);
+      if (!jsOn && !jsOff) return '(?:';
+      return `(?${jsOn}${jsOff ? '-' + jsOff : ''}:`;
+    });
   if (rflags.includes('x')) {
     src = src.replace(/\\?\s|#.*$/gm, (m) => (m[0] === '\\' ? m : ''));
   }
@@ -415,9 +423,19 @@ function isInt(v) { return typeof v === 'number'; }
 function mkfloat(v) { return new RFloat(v); }
 
 // ---- to_s / inspect -------------------------------------------------------
+// Ruby's Regexp#to_s: (?on-off:source) with flags ordered m,i,x — used when a
+// Regexp is interpolated into another regex or a string.
+function regexpToS(s) {
+  const fl = s.rflags || '';
+  const on = ['m', 'i', 'x'].filter((f) => fl.includes(f)).join('');
+  const off = ['m', 'i', 'x'].filter((f) => !fl.includes(f)).join('');
+  return `(?${on}-${off}:${s.source})`;
+}
+
 function toS(v) {
   // returns a JS string
   if (v === null || v === undefined) return '';
+  if (v instanceof RRegexp) return regexpToS(v);
   if (v === true) return 'true';
   if (v === false) return 'false';
   if (typeof v === 'number') return String(v);
@@ -702,6 +720,9 @@ function rbRaise(arg1, arg2) {
   // raise SomeError, "msg"      -> SomeError.new("msg")
   // raise <exception instance>  -> throw it
   if (arg1 === undefined || arg1 === null) {
+    // bare `raise` re-raises the exception currently being handled ($!)
+    const cur = gvars['$!'];
+    if (cur != null) throw new RubyError(cur);
     raiseError(RuntimeErrorC, 'unhandled exception');
   }
   if (arg1 instanceof RString) raiseError(RuntimeErrorC, arg1.value);
@@ -2149,7 +2170,7 @@ function installRegexp() {
   def(RG, '=~', (s, a) => { if (!(a[0] instanceof RString)) return null; const m = a[0].value.match(new RegExp(s.re.source, s.re.flags.replace('g', ''))); return m ? m.index : null; });
   def(RG, '===', (s, a) => { if (!(a[0] instanceof RString || a[0] instanceof RSymbol)) { return false; } const str = toS(a[0]); const m = str.match(new RegExp(s.re.source, s.re.flags.replace('g', ''))); gvars['$~'] = m ? mkMatchData(m, str) : null; return !!m; });
   def(RG, 'source', (s) => new RString(s.source));
-  def(RG, 'to_s', (s) => new RString(`(?-mix:${s.source})`));
+  def(RG, 'to_s', (s) => new RString(regexpToS(s)));
   def(RG, 'inspect', (s) => new RString('/' + s.source + '/' + s.rflags.replace(/[^imx]/g, '')));
   def(RG, '==', (s, a) => a[0] instanceof RRegexp && s.source === a[0].source && s.rflags === a[0].rflags);
   def(RG, 'names', (s) => { const names = []; const re = /\(\?<([a-zA-Z_]\w*)>/g; let m; while ((m = re.exec(s.source))) names.push(new RString(m[1])); return names; });
