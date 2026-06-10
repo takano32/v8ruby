@@ -428,6 +428,16 @@ function floatToS(n) {
   if (Number.isNaN(n)) return 'NaN';
   if (n === Infinity) return 'Infinity';
   if (n === -Infinity) return '-Infinity';
+  const abs = Math.abs(n);
+  if (abs !== 0 && (abs >= 1e15 || abs < 1e-4)) {
+    // Use scientific notation matching MRI format: sign + digits + e+/-NN (2-digit exp)
+    let s = n.toExponential();
+    // toExponential gives e.g. "1e+15", "1.23e-5" — normalize exponent to 2 digits with sign
+    s = s.replace(/e([+-])(\d)$/, 'e$10$2');
+    // Ensure there's a decimal point: "1e+15" → "1.0e+15"
+    s = s.replace(/^(-?\d+)(e)/, '$1.0$2');
+    return s;
+  }
   if (Number.isInteger(n)) return n.toFixed(1);
   return String(n);
 }
@@ -1291,6 +1301,13 @@ function installNumeric() {
   def(NumericC, 'step', IntegerC.methods.get('step'));
 }
 
+function checkFrozen(obj) {
+  if (obj && obj.__frozen) {
+    const cn = classOf(obj) ? classOf(obj).name : 'Object';
+    raiseError(FrozenErrorC, `can't modify frozen ${cn}: ${inspect(obj)}`);
+  }
+}
+
 // ---- String ---------------------------------------------------------------
 function installString() {
   const S = StringC;
@@ -1306,9 +1323,9 @@ function installString() {
   });
   def(S, '+', (s, a) => { if (!(a[0] instanceof RString)) raiseError(TypeErrorC, `no implicit conversion of ${classOf(a[0]).name} into String`); return new RString(s.value + a[0].value); });
   def(S, '*', (s, a) => new RString(s.value.repeat(numVal(a[0]))));
-  def(S, '<<', (s, a) => { s.value += (typeof a[0] === 'number' ? String.fromCharCode(a[0]) : toS(a[0])); return s; });
-  def(S, 'concat', (s, a) => { for (const x of a) s.value += toS(x); return s; });
-  def(S, 'prepend', (s, a) => { s.value = a.map(toS).join('') + s.value; return s; });
+  def(S, '<<', (s, a) => { checkFrozen(s); s.value += (typeof a[0] === 'number' ? String.fromCharCode(a[0]) : toS(a[0])); return s; });
+  def(S, 'concat', (s, a) => { checkFrozen(s); for (const x of a) s.value += toS(x); return s; });
+  def(S, 'prepend', (s, a) => { checkFrozen(s); s.value = a.map(toS).join('') + s.value; return s; });
   def(S, '%', (s, a) => new RString(sprintf(s.value, Array.isArray(a[0]) ? a[0] : [a[0]])));
   def(S, '+@', (s) => (s.__frozen ? new RString(s.value) : s));
   def(S, '-@', (s) => { s.__frozen = true; return s; });
@@ -1324,19 +1341,19 @@ function installString() {
   def(S, 'bytesize', (s) => Buffer.byteLength(s.value, 'utf8'));
   def(S, 'upcase', (s) => new RString(s.value.toUpperCase()));
   def(S, 'downcase', (s) => new RString(s.value.toLowerCase()));
-  def(S, 'upcase!', (s) => { const o = s.value; s.value = s.value.toUpperCase(); return o === s.value ? null : s; });
-  def(S, 'downcase!', (s) => { const o = s.value; s.value = s.value.toLowerCase(); return o === s.value ? null : s; });
+  def(S, 'upcase!', (s) => { checkFrozen(s); const o = s.value; s.value = s.value.toUpperCase(); return o === s.value ? null : s; });
+  def(S, 'downcase!', (s) => { checkFrozen(s); const o = s.value; s.value = s.value.toLowerCase(); return o === s.value ? null : s; });
   def(S, 'capitalize', (s) => new RString(s.value.charAt(0).toUpperCase() + s.value.slice(1).toLowerCase()));
-  def(S, 'capitalize!', (s) => { const o = s.value; s.value = s.value.charAt(0).toUpperCase() + s.value.slice(1).toLowerCase(); return o === s.value ? null : s; });
+  def(S, 'capitalize!', (s) => { checkFrozen(s); const o = s.value; s.value = s.value.charAt(0).toUpperCase() + s.value.slice(1).toLowerCase(); return o === s.value ? null : s; });
   def(S, 'swapcase', (s) => new RString(s.value.replace(/[a-zA-Z]/g, (c) => (c === c.toUpperCase() ? c.toLowerCase() : c.toUpperCase()))));
   def(S, 'reverse', (s) => new RString([...s.value].reverse().join('')));
-  def(S, 'reverse!', (s) => { s.value = [...s.value].reverse().join(''); return s; });
+  def(S, 'reverse!', (s) => { checkFrozen(s); s.value = [...s.value].reverse().join(''); return s; });
   def(S, 'strip', (s) => new RString(s.value.replace(/^\s+|\s+$/g, '')));
   def(S, 'lstrip', (s) => new RString(s.value.replace(/^\s+/, '')));
   def(S, 'rstrip', (s) => new RString(s.value.replace(/\s+$/, '')));
-  def(S, 'strip!', (s) => { const o = s.value; s.value = s.value.trim(); return o === s.value ? null : s; });
+  def(S, 'strip!', (s) => { checkFrozen(s); const o = s.value; s.value = s.value.trim(); return o === s.value ? null : s; });
   def(S, 'chomp', (s, a) => new RString(a[0] ? (s.value.endsWith(jsstr(a[0])) ? s.value.slice(0, -jsstr(a[0]).length) : s.value) : s.value.replace(/\r?\n$/, '')));
-  def(S, 'chomp!', (s, a) => { const o = s.value; s.value = jsstr(send(s, 'chomp', a)); return o === s.value ? null : s; });
+  def(S, 'chomp!', (s, a) => { checkFrozen(s); const o = s.value; s.value = jsstr(send(s, 'chomp', a)); return o === s.value ? null : s; });
   def(S, 'chop', (s) => new RString(s.value.replace(/(\r\n|.)$/, '')));
   def(S, 'chars', (s) => [...s.value].map((c) => new RString(c)));
   def(S, 'bytes', (s) => [...Buffer.from(s.value, 'utf8')]);
@@ -1350,11 +1367,11 @@ function installString() {
   def(S, 'end_with?', (s, a) => a.some((x) => s.value.endsWith(jsstr(x))));
   def(S, 'index', (s, a) => { if (a[0] instanceof RRegexp) { const re = jsRe(a[0], true); re.lastIndex = a[1] != null ? numVal(a[1]) : 0; const m = re.exec(s.value); return m ? m.index : null; } const i = s.value.indexOf(jsstr(a[0]), a[1] != null ? numVal(a[1]) : 0); return i < 0 ? null : i; });
   def(S, 'rindex', (s, a) => { const i = s.value.lastIndexOf(jsstr(a[0])); return i < 0 ? null : i; });
-  def(S, 'replace', (s, a) => { s.value = jsstr(a[0]); return s; });
+  def(S, 'replace', (s, a) => { checkFrozen(s); s.value = jsstr(a[0]); return s; });
   def(S, 'sub', (s, a, blk) => new RString(strSub(s.value, a, blk, false)));
   def(S, 'gsub', (s, a, blk) => new RString(strSub(s.value, a, blk, true)));
-  def(S, 'sub!', (s, a, blk) => { const o = s.value; s.value = strSub(s.value, a, blk, false); return o === s.value ? null : s; });
-  def(S, 'gsub!', (s, a, blk) => { const o = s.value; s.value = strSub(s.value, a, blk, true); return o === s.value ? null : s; });
+  def(S, 'sub!', (s, a, blk) => { checkFrozen(s); const o = s.value; s.value = strSub(s.value, a, blk, false); return o === s.value ? null : s; });
+  def(S, 'gsub!', (s, a, blk) => { checkFrozen(s); const o = s.value; s.value = strSub(s.value, a, blk, true); return o === s.value ? null : s; });
   def(S, 'tr', (s, a) => new RString(strTr(s.value, jsstr(a[0]), jsstr(a[1]))));
   def(S, 'delete', (s, a) => new RString(strTr(s.value, jsstr(a[0]), '')));
   def(S, 'count', (s, a) => { const set = expandTr(jsstr(a[0])); let n = 0; for (const c of s.value) if (set.includes(c)) n++; return n; });
@@ -1446,6 +1463,7 @@ function strSlice(s, a) {
   return new RString(str[i]);
 }
 function strSliceSet(s, a) {
+  checkFrozen(s);
   const val = jsstr(a[a.length - 1]);
   if (a[0] instanceof RRange) { const [st, len] = rangeToSlice(a[0], s.value.length); s.value = s.value.slice(0, st) + val + s.value.slice(st + len); return a[a.length - 1]; }
   if (a[0] instanceof RString) { s.value = s.value.replace(a[0].value, val); return a[a.length - 1]; }
@@ -1498,12 +1516,12 @@ function installArray() {
     return out;
   });
   sdef(A, '[]', (cls, a) => a.slice());
-  def(A, '<<', (s, a) => { s.push(a[0]); return s; });
-  def(A, 'push', (s, a) => { for (const x of a) s.push(x); return s; });
+  def(A, '<<', (s, a) => { checkFrozen(s); s.push(a[0]); return s; });
+  def(A, 'push', (s, a) => { checkFrozen(s); for (const x of a) s.push(x); return s; });
   def(A, 'append', A.methods.get('push'));
-  def(A, 'pop', (s, a) => (a[0] != null ? s.splice(Math.max(0, s.length - numVal(a[0]))) : (s.length ? s.pop() : null)));
-  def(A, 'shift', (s, a) => (a[0] != null ? s.splice(0, numVal(a[0])) : (s.length ? s.shift() : null)));
-  def(A, 'unshift', (s, a) => { s.unshift(...a); return s; });
+  def(A, 'pop', (s, a) => { checkFrozen(s); return a[0] != null ? s.splice(Math.max(0, s.length - numVal(a[0]))) : (s.length ? s.pop() : null); });
+  def(A, 'shift', (s, a) => { checkFrozen(s); return a[0] != null ? s.splice(0, numVal(a[0])) : (s.length ? s.shift() : null); });
+  def(A, 'unshift', (s, a) => { checkFrozen(s); s.unshift(...a); return s; });
   def(A, 'prepend', A.methods.get('unshift'));
   def(A, '[]', (s, a) => arrSlice(s, a));
   def(A, 'slice', (s, a) => arrSlice(s, a));
@@ -1524,17 +1542,17 @@ function installArray() {
   def(A, 'reverse_each', (s, a, blk) => { try { for (let i = s.length - 1; i >= 0; i--) callBlock(blk, [s[i]]); } catch (e) { return brk(e); } return s; });
   def(A, 'map', (s, a, blk) => { if (!blk) return mkEnum(function* () { yield* s; }); const out = []; try { for (const x of s) out.push(callBlock(blk, [x])); } catch (e) { return brk(e); } return out; });
   def(A, 'collect', A.methods.get('map'));
-  def(A, 'map!', (s, a, blk) => { for (let i = 0; i < s.length; i++) s[i] = callBlock(blk, [s[i]]); return s; });
+  def(A, 'map!', (s, a, blk) => { checkFrozen(s); for (let i = 0; i < s.length; i++) s[i] = callBlock(blk, [s[i]]); return s; });
   def(A, 'collect!', A.methods.get('map!'));
   def(A, 'flat_map', (s, a, blk) => { const out = []; for (const x of s) { const r = callBlock(blk, [x]); if (Array.isArray(r)) out.push(...r); else out.push(r); } return out; });
   def(A, 'collect_concat', A.methods.get('flat_map'));
   def(A, 'select', (s, a, blk) => { const out = []; try { for (const x of s) if (truthy(callBlock(blk, [x]))) out.push(x); } catch (e) { return brk(e); } return out; });
   def(A, 'filter', A.methods.get('select'));
-  def(A, 'select!', (s, a, blk) => { const keep = s.filter((x) => truthy(callBlock(blk, [x]))); s.length = 0; s.push(...keep); return s; });
+  def(A, 'select!', (s, a, blk) => { checkFrozen(s); const keep = s.filter((x) => truthy(callBlock(blk, [x]))); s.length = 0; s.push(...keep); return s; });
   def(A, 'filter!', A.methods.get('select!'));
   def(A, 'keep_if', A.methods.get('select!'));
   def(A, 'reject', (s, a, blk) => { const out = []; for (const x of s) if (!truthy(callBlock(blk, [x]))) out.push(x); return out; });
-  def(A, 'reject!', (s, a, blk) => { const keep = s.filter((x) => !truthy(callBlock(blk, [x]))); s.length = 0; s.push(...keep); return s; });
+  def(A, 'reject!', (s, a, blk) => { checkFrozen(s); const keep = s.filter((x) => !truthy(callBlock(blk, [x]))); s.length = 0; s.push(...keep); return s; });
   def(A, 'delete_if', A.methods.get('reject!'));
   def(A, 'filter_map', (s, a, blk) => { const out = []; for (const x of s) { const r = callBlock(blk, [x]); if (truthy(r)) out.push(r); } return out; });
   def(A, 'find', (s, a, blk) => { for (const x of s) if (truthy(callBlock(blk, [x]))) return x; return null; });
@@ -1558,7 +1576,7 @@ function installArray() {
   def(A, 'reduce', (s, a, blk) => arrReduce(s, a, blk));
   def(A, 'inject', A.methods.get('reduce'));
   def(A, 'sort', (s, a, blk) => s.slice().sort((x, y) => (blk ? numVal(callBlock(blk, [x, y])) : spaceship(x, y))));
-  def(A, 'sort!', (s, a, blk) => { s.sort((x, y) => (blk ? numVal(callBlock(blk, [x, y])) : spaceship(x, y))); return s; });
+  def(A, 'sort!', (s, a, blk) => { checkFrozen(s); s.sort((x, y) => (blk ? numVal(callBlock(blk, [x, y])) : spaceship(x, y))); return s; });
   def(A, 'sort_by', (s, a, blk) => s.map((x) => [callBlock(blk, [x]), x]).sort((p, q) => spaceship(p[0], q[0])).map((p) => p[1]));
   def(A, 'sort_by!', (s, a, blk) => { const r = send(s, 'sort_by', a, blk); s.length = 0; s.push(...r); return s; });
   def(A, 'group_by', (s, a, blk) => { const h = new RHash(); for (const x of s) { const k = callBlock(blk, [x]); if (!h.has(k)) h.set(k, []); h.get(k).push(x); } return h; });
@@ -1566,13 +1584,13 @@ function installArray() {
   def(A, 'chunk_while', (s, a, blk) => { if (!s.length) return []; const out = [[s[0]]]; for (let i = 1; i < s.length; i++) { if (truthy(callBlock(blk, [s[i - 1], s[i]]))) out[out.length - 1].push(s[i]); else out.push([s[i]]); } return out; });
   def(A, 'tally', (s) => { const h = new RHash(); for (const x of s) h.set(x, (h.get(x) || 0) + 1); return h; });
   def(A, 'reverse', (s) => s.slice().reverse());
-  def(A, 'reverse!', (s) => { s.reverse(); return s; });
+  def(A, 'reverse!', (s) => { checkFrozen(s); s.reverse(); return s; });
   def(A, 'flatten', (s, a) => flatten(s, a[0] != null ? numVal(a[0]) : Infinity));
-  def(A, 'flatten!', (s, a) => { const f = flatten(s, a[0] != null ? numVal(a[0]) : Infinity); s.length = 0; s.push(...f); return s; });
+  def(A, 'flatten!', (s, a) => { checkFrozen(s); const f = flatten(s, a[0] != null ? numVal(a[0]) : Infinity); s.length = 0; s.push(...f); return s; });
   def(A, 'compact', (s) => s.filter((x) => x !== null));
-  def(A, 'compact!', (s) => { const f = s.filter((x) => x !== null); s.length = 0; s.push(...f); return s; });
+  def(A, 'compact!', (s) => { checkFrozen(s); const f = s.filter((x) => x !== null); s.length = 0; s.push(...f); return s; });
   def(A, 'uniq', (s, a, blk) => arrUniq(s, blk));
-  def(A, 'uniq!', (s, a, blk) => { const u = arrUniq(s, blk); s.length = 0; s.push(...u); return s; });
+  def(A, 'uniq!', (s, a, blk) => { checkFrozen(s); const u = arrUniq(s, blk); s.length = 0; s.push(...u); return s; });
   def(A, 'join', (s, a) => new RString(flatten(s, Infinity).map(toS).join(a[0] != null ? jsstr(a[0]) : '')));
   def(A, 'to_a', (s) => s);
   def(A, 'to_ary', (s) => s);
@@ -1597,12 +1615,12 @@ function installArray() {
   def(A, 'rotate', (s, a) => { const n = ((a[0] != null ? numVal(a[0]) : 1) % s.length + s.length) % (s.length || 1); return s.slice(n).concat(s.slice(0, n)); });
   def(A, 'sample', (s) => (s.length ? s[Math.floor(Math.random() * s.length)] : null));
   def(A, 'shuffle', (s) => { const c = s.slice(); for (let i = c.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [c[i], c[j]] = [c[j], c[i]]; } return c; });
-  def(A, 'fill', (s, a, blk) => { for (let i = 0; i < s.length; i++) s[i] = blk ? callBlock(blk, [i]) : a[0]; return s; });
-  def(A, 'insert', (s, a) => { let i = numVal(a[0]); if (i < 0) i += s.length + 1; s.splice(i, 0, ...a.slice(1)); return s; });
-  def(A, 'delete', (s, a) => { let found = null; for (let i = s.length - 1; i >= 0; i--) if (rbEqual(s[i], a[0])) { found = s[i]; s.splice(i, 1); } return found; });
-  def(A, 'delete_at', (s, a) => { let i = numVal(a[0]); if (i < 0) i += s.length; if (i < 0 || i >= s.length) return null; return s.splice(i, 1)[0]; });
-  def(A, 'clear', (s) => { s.length = 0; return s; });
-  def(A, 'replace', (s, a) => { s.length = 0; s.push(...a[0]); return s; });
+  def(A, 'fill', (s, a, blk) => { checkFrozen(s); for (let i = 0; i < s.length; i++) s[i] = blk ? callBlock(blk, [i]) : a[0]; return s; });
+  def(A, 'insert', (s, a) => { checkFrozen(s); let i = numVal(a[0]); if (i < 0) i += s.length + 1; s.splice(i, 0, ...a.slice(1)); return s; });
+  def(A, 'delete', (s, a) => { checkFrozen(s); let found = null; for (let i = s.length - 1; i >= 0; i--) if (rbEqual(s[i], a[0])) { found = s[i]; s.splice(i, 1); } return found; });
+  def(A, 'delete_at', (s, a) => { checkFrozen(s); let i = numVal(a[0]); if (i < 0) i += s.length; if (i < 0 || i >= s.length) return null; return s.splice(i, 1)[0]; });
+  def(A, 'clear', (s) => { checkFrozen(s); s.length = 0; return s; });
+  def(A, 'replace', (s, a) => { checkFrozen(s); s.length = 0; s.push(...a[0]); return s; });
   def(A, 'concat', A.methods.get('concat'));
   def(A, 'min', A.methods.get('min'));
   def(A, 'product', (s, a) => arrProduct([s, ...a]));
@@ -1646,6 +1664,7 @@ function arrSlice(s, a) {
   return s[i];
 }
 function arrSet(s, a) {
+  checkFrozen(s);
   const val = a[a.length - 1];
   if (a[0] instanceof RRange) { const [st, len] = rangeToSlice(a[0], s.length); s.splice(st, len, ...(Array.isArray(val) ? val : [val])); return val; }
   if (a.length >= 3) { let i = numVal(a[0]); if (i < 0) i += s.length; const len = numVal(a[1]); s.splice(i, len, ...(Array.isArray(val) ? val : [val])); return val; }
@@ -1672,8 +1691,8 @@ function installHash() {
   });
   sdef(H, '[]', (cls, a) => { const h = new RHash(); if (a.length === 1 && a[0] instanceof RHash) { for (const [k, v] of a[0].entries()) h.set(k, v); } else if (a.length === 1 && Array.isArray(a[0])) { for (const pair of a[0]) h.set(pair[0], pair[1]); } else { for (let i = 0; i + 1 < a.length; i += 2) h.set(a[i], a[i + 1]); } return h; });
   def(H, '[]', (s, a) => { const e = s.map.get(hashKey(a[0])); if (e) return e.value; if (s.defaultProc) return callBlock(s.defaultProc, [s, a[0]]); return s.defaultValue; });
-  def(H, '[]=', (s, a) => { s.set(a[0], a[1]); return a[1]; });
-  def(H, 'store', (s, a) => { s.set(a[0], a[1]); return a[1]; });
+  def(H, '[]=', (s, a) => { checkFrozen(s); s.set(a[0], a[1]); return a[1]; });
+  def(H, 'store', (s, a) => { checkFrozen(s); s.set(a[0], a[1]); return a[1]; });
   def(H, 'fetch', (s, a, blk) => { const e = s.map.get(hashKey(a[0])); if (e) return e.value; if (blk) return callBlock(blk, [a[0]]); if (a.length >= 2) return a[1]; raiseError(KeyErrorC, `key not found: ${inspect(a[0])}`); });
   def(H, 'dig', (s, a) => { let cur = s; for (const k of a) { if (cur === null) return null; cur = send(cur, '[]', [k]); } return cur; });
   def(H, 'key?', (s, a) => s.has(a[0]));
@@ -1717,14 +1736,14 @@ function installHash() {
   def(H, 'group_by', (s, a, blk) => { const h = new RHash(); for (const [k, v] of s.entries()) { const gk = callBlock(blk, [k, v]); if (!h.has(gk)) h.set(gk, []); h.get(gk).push([k, v]); } return h; });
   def(H, 'partition', (s, a, blk) => { const t = [], f = []; for (const [k, v] of s.entries()) (truthy(callBlock(blk, [k, v])) ? t : f).push([k, v]); return [t, f]; });
   def(H, 'merge', (s, a, blk) => { const h = new RHash(); for (const [k, v] of s.entries()) h.set(k, v); for (const o of a) for (const [k, v] of o.entries()) { if (blk && h.has(k)) h.set(k, callBlock(blk, [k, h.get(k), v])); else h.set(k, v); } return h; });
-  def(H, 'merge!', (s, a, blk) => { for (const o of a) for (const [k, v] of o.entries()) { if (blk && s.has(k)) s.set(k, callBlock(blk, [k, s.get(k), v])); else s.set(k, v); } return s; });
+  def(H, 'merge!', (s, a, blk) => { checkFrozen(s); for (const o of a) for (const [k, v] of o.entries()) { if (blk && s.has(k)) s.set(k, callBlock(blk, [k, s.get(k), v])); else s.set(k, v); } return s; });
   def(H, 'update', H.methods.get('merge!'));
-  def(H, 'delete', (s, a, blk) => { if (s.has(a[0])) return s.delete(a[0]); return blk ? callBlock(blk, [a[0]]) : null; });
-  def(H, 'delete_if', (s, a, blk) => { for (const k of s.keys()) if (truthy(callBlock(blk, [k, s.get(k)]))) s.delete(k); return s; });
+  def(H, 'delete', (s, a, blk) => { checkFrozen(s); if (s.has(a[0])) return s.delete(a[0]); return blk ? callBlock(blk, [a[0]]) : null; });
+  def(H, 'delete_if', (s, a, blk) => { checkFrozen(s); for (const k of s.keys()) if (truthy(callBlock(blk, [k, s.get(k)]))) s.delete(k); return s; });
   def(H, 'reject!', H.methods.get('delete_if'));
-  def(H, 'keep_if', (s, a, blk) => { for (const k of s.keys()) if (!truthy(callBlock(blk, [k, s.get(k)]))) s.delete(k); return s; });
+  def(H, 'keep_if', (s, a, blk) => { checkFrozen(s); for (const k of s.keys()) if (!truthy(callBlock(blk, [k, s.get(k)]))) s.delete(k); return s; });
   def(H, 'select!', H.methods.get('keep_if'));
-  def(H, 'clear', (s) => { s.map.clear(); return s; });
+  def(H, 'clear', (s) => { checkFrozen(s); s.map.clear(); return s; });
   def(H, 'to_a', (s) => [...s.entries()].map(([k, v]) => [k, v]));
   def(H, 'to_h', (s, a, blk) => { if (!blk) return s; const h = new RHash(); for (const [k, v] of s.entries()) { const pair = callBlock(blk, [k, v]); h.set(pair[0], pair[1]); } return h; });
   def(H, 'invert', (s) => { const h = new RHash(); for (const [k, v] of s.entries()) h.set(v, k); return h; });
