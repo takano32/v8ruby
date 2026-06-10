@@ -1365,8 +1365,21 @@ function installString() {
   def(S, 'include?', (s, a) => s.value.includes(jsstr(a[0])));
   def(S, 'start_with?', (s, a) => a.some((x) => s.value.startsWith(jsstr(x))));
   def(S, 'end_with?', (s, a) => a.some((x) => s.value.endsWith(jsstr(x))));
-  def(S, 'index', (s, a) => { if (a[0] instanceof RRegexp) { const re = jsRe(a[0], true); re.lastIndex = a[1] != null ? numVal(a[1]) : 0; const m = re.exec(s.value); return m ? m.index : null; } const i = s.value.indexOf(jsstr(a[0]), a[1] != null ? numVal(a[1]) : 0); return i < 0 ? null : i; });
-  def(S, 'rindex', (s, a) => { const i = s.value.lastIndexOf(jsstr(a[0])); return i < 0 ? null : i; });
+  def(S, 'index', (s, a) => {
+    const chars = [...s.value];
+    if (a[0] instanceof RRegexp) {
+      const offset = a[1] != null ? chars.slice(0, numVal(a[1])).join('').length : 0;
+      const re = jsRe(a[0], true); re.lastIndex = offset;
+      const m = re.exec(s.value); if (!m) return null;
+      return [...s.value.slice(0, m.index)].length;
+    }
+    const needle = jsstr(a[0]);
+    const startChar = a[1] != null ? numVal(a[1]) : 0;
+    const startByte = chars.slice(0, startChar < 0 ? Math.max(0, chars.length + startChar) : startChar).join('').length;
+    const bi = s.value.indexOf(needle, startByte);
+    return bi < 0 ? null : [...s.value.slice(0, bi)].length;
+  });
+  def(S, 'rindex', (s, a) => { const needle = jsstr(a[0]); const bi = s.value.lastIndexOf(needle); return bi < 0 ? null : [...s.value.slice(0, bi)].length; });
   def(S, 'replace', (s, a) => { checkFrozen(s); s.value = jsstr(a[0]); return s; });
   def(S, 'sub', (s, a, blk) => new RString(strSub(s.value, a, blk, false)));
   def(S, 'gsub', (s, a, blk) => new RString(strSub(s.value, a, blk, true)));
@@ -1454,22 +1467,25 @@ function expandTr(spec) {
   } return out;
 }
 function strSlice(s, a) {
-  const str = s.value;
-  if (a[0] instanceof RRange) { const [st, len] = rangeToSlice(a[0], str.length); if (st === null) return null; return new RString(str.substr(st, len)); }
-  if (a[0] instanceof RString) return str.includes(a[0].value) ? new RString(a[0].value) : null;
-  let i = numVal(a[0]); if (i < 0) i += str.length;
-  if (a.length >= 2) { let len = numVal(a[1]); if (i < 0 || i > str.length || len < 0) return null; return new RString(str.substr(i, len)); }
-  if (i < 0 || i >= str.length) return null;
-  return new RString(str[i]);
+  const chars = [...s.value];
+  if (a[0] instanceof RRange) { const [st, len] = rangeToSlice(a[0], chars.length); if (st === null) return null; return new RString(chars.slice(st, st + len).join('')); }
+  if (a[0] instanceof RRegexp) { const m = s.value.match(new RegExp(a[0].re.source, a[0].re.flags.replace('g', ''))); gvars['$~'] = m ? mkMatchData(m, s.value) : null; if (!m) return null; const g = a[1] != null ? numVal(a[1]) : 0; return g < 0 ? (m[m.length + g] != null ? new RString(m[m.length + g]) : null) : (m[g] != null ? new RString(m[g]) : null); }
+  if (a[0] instanceof RString) return s.value.includes(a[0].value) ? new RString(a[0].value) : null;
+  let i = numVal(a[0]); if (i < 0) i += chars.length;
+  if (a.length >= 2) { let len = numVal(a[1]); if (i < 0 || i > chars.length || len < 0) return null; return new RString(chars.slice(i, i + len).join('')); }
+  if (i < 0 || i >= chars.length) return null;
+  return new RString(chars[i]);
 }
 function strSliceSet(s, a) {
   checkFrozen(s);
   const val = jsstr(a[a.length - 1]);
-  if (a[0] instanceof RRange) { const [st, len] = rangeToSlice(a[0], s.value.length); s.value = s.value.slice(0, st) + val + s.value.slice(st + len); return a[a.length - 1]; }
+  const chars = [...s.value];
+  if (a[0] instanceof RRange) { const [st, len] = rangeToSlice(a[0], chars.length); const repl = [...val]; chars.splice(st, len, ...repl); s.value = chars.join(''); return a[a.length - 1]; }
   if (a[0] instanceof RString) { s.value = s.value.replace(a[0].value, val); return a[a.length - 1]; }
-  let i = numVal(a[0]); if (i < 0) i += s.value.length;
+  let i = numVal(a[0]); if (i < 0) i += chars.length;
   const len = a.length >= 3 ? numVal(a[1]) : 1;
-  s.value = s.value.slice(0, i) + val + s.value.slice(i + len);
+  chars.splice(i, len, ...[...val]);
+  s.value = chars.join('');
   return a[a.length - 1];
 }
 function rangeToSlice(r, len) {
