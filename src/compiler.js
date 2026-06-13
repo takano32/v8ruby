@@ -372,6 +372,42 @@ export class Compiler {
 
   iife(stmt) { return `(() => { ${stmt} })()`; }
 
+  // Run `fn` with the code-gen scope state swapped to a nested scope, restoring
+  // the previous state afterwards. `ctx`/`classRef`/`selfRef` are evaluated by
+  // the caller (so block ctx can extend the current ctx before the swap).
+  withScope(scope, ctx, classRef, selfRef, fn) {
+    const ps = this.scope, pc = this.ctx, pcr = this.classRef, psf = this.selfRef;
+    this.scope = scope; this.ctx = ctx; this.classRef = classRef; this.selfRef = selfRef;
+    try { return fn(); } finally {
+      this.scope = ps; this.ctx = pc; this.classRef = pcr; this.selfRef = psf;
+    }
+  }
+
+  // Emit a `function ($self, $args, $blk) {...}` for a def/singleton-def body.
+  genMethodFn(node) {
+    const prevMethod = this.methodName;
+    this.methodName = node.name;
+    const fn = this.withScope(node.__scope, ['method'], '$dc', '$self', () => {
+      const bind = this.genParamBinding(node.params, false);
+      const body = this.genFnBody(node.body, node.__scope, { wrapReturn: true });
+      return `function ($self, $args, $blk) {\n${bind}\n${body}\n}`;
+    });
+    this.methodName = prevMethod;
+    return fn;
+  }
+
+  // Emit a `function ($cls) {...}` class/module body builder. `nestingPath` is
+  // pushed onto the lexical nesting while emitting (null for a singleton class).
+  genClassBuilder(scope, body, nestingPath) {
+    return this.withScope(scope, ['method'], '$cls', '$self', () => {
+      if (nestingPath !== null) this.nesting.push(nestingPath);
+      const decls = this.declList(scope);
+      const inner = this.genReturningBody(body);
+      if (nestingPath !== null) this.nesting.pop();
+      return `function ($cls) {\nconst $self = $cls;\nconst $blk = null;\n${decls}\n${inner}\n}`;
+    });
+  }
+
   genRegex(node) {
     let src;
     if (node.parts.length === 1 && 'str' in node.parts[0]) src = this.q(node.parts[0].str);
@@ -511,8 +547,6 @@ export class Compiler {
   }
 
   genMultiAssign(node) {
-    const splatIndex = node.targets.findIndex((t) => t.type === 'SplatTarget');
-    const count = node.targets.length;
     let rhs;
     if (node.values.length === 1 && node.values[0].type !== 'Splat') {
       rhs = this.gen(node.values[0]);
@@ -649,10 +683,11 @@ export class Compiler {
 
   beginToJs(node, ret) {
     const emit = (body) => (ret ? this.genReturningBody(body) : this.genStmts(body));
+    // With an else clause, the main body runs in side-effect (non-returning)
+    // position and the else clause carries the value; otherwise the body does.
     const tryBody = node.elseBody
-      ? emit2(this, node.body, false) + '\n' + emit(node.elseBody)
+      ? this.genStmts(node.body) + '\n' + emit(node.elseBody)
       : emit(node.body);
-    function emit2(self, body, r) { return body.map((s) => self.genStmt(s)).join('\n'); }
 
     const useRetry = node.rescues.some((r) => hasRetry(r.body));
 
@@ -703,51 +738,19 @@ export class Compiler {
     const target = node.singleton
       ? (node.singleton.type === 'Self' ? this.selfRef : this.gen(node.singleton))
       : 'R.currentDefinee()';
-
-    const prevMethod = this.methodName;
-    this.methodName = node.name;
-    const scope = node.__scope;
-    const prevScope = this.scope, prevCtx = this.ctx, prevClassRef = this.classRef, prevSelf = this.selfRef;
-    this.scope = scope;
-    this.ctx = ['method'];
-    this.classRef = '$dc';
-    this.selfRef = '$self';
-    const bind = this.genParamBinding(node.params, false);
-    const body = this.genFnBody(node.body, scope, { wrapReturn: true });
-    this.scope = prevScope;
-    this.ctx = prevCtx;
-    this.classRef = prevClassRef;
-    this.selfRef = prevSelf;
-    this.methodName = prevMethod;
-    const fn = `function ($self, $args, $blk) {\n${bind}\n${body}\n}`;
+    const fn = this.genMethodFn(node);
     const defFn = node.singleton ? 'defineSMethod' : 'defineMethod';
     return `(($dc) => R.${defFn}($dc, ${this.q(node.name)}, ${fn}))(${target})`;
   }
 
   genClass(node) {
     const superExpr = node.superclass ? this.gen(node.superclass) : 'null';
-    const scope = node.__scope;
-    const prevScope = this.scope, prevClassRef = this.classRef, prevCtx = this.ctx, prevSelf = this.selfRef;
-    this.scope = scope; this.classRef = '$cls'; this.ctx = ['method']; this.selfRef = '$self';
-    this.nesting.push(this.childPath(node.name));
-    const decls = this.declList(scope);
-    const body = this.genReturningBody(node.body);
-    this.nesting.pop();
-    this.scope = prevScope; this.classRef = prevClassRef; this.ctx = prevCtx; this.selfRef = prevSelf;
-    const builder = `function ($cls) {\nconst $self = $cls;\nconst $blk = null;\n${decls}\n${body}\n}`;
+    const builder = this.genClassBuilder(node.__scope, node.body, this.childPath(node.name));
     return `R.defineClass(${this.q(node.name)}, ${superExpr}, ${builder}, null)`;
   }
 
   genModule(node) {
-    const scope = node.__scope;
-    const prevScope = this.scope, prevClassRef = this.classRef, prevCtx = this.ctx, prevSelf = this.selfRef;
-    this.scope = scope; this.classRef = '$cls'; this.ctx = ['method']; this.selfRef = '$self';
-    this.nesting.push(this.childPath(node.name));
-    const decls = this.declList(scope);
-    const body = this.genReturningBody(node.body);
-    this.nesting.pop();
-    this.scope = prevScope; this.classRef = prevClassRef; this.ctx = prevCtx; this.selfRef = prevSelf;
-    const builder = `function ($cls) {\nconst $self = $cls;\nconst $blk = null;\n${decls}\n${body}\n}`;
+    const builder = this.genClassBuilder(node.__scope, node.body, this.childPath(node.name));
     return `R.defineModule(${this.q(node.name)}, ${builder}, null)`;
   }
 
@@ -763,25 +766,13 @@ export class Compiler {
     // singleton class as the current definee, so any `def`/attr/alias (even when
     // nested in if/case/begin) becomes a singleton method on obj.
     const obj = this.gen(node.obj);
-    const scope = node.__scope;
-    const prevScope = this.scope, prevClassRef = this.classRef, prevCtx = this.ctx, prevSelf = this.selfRef;
-    this.scope = scope; this.classRef = '$cls'; this.ctx = ['method']; this.selfRef = '$self';
-    const decls = this.declList(scope);
-    const body = this.genReturningBody(node.body);
-    this.scope = prevScope; this.classRef = prevClassRef; this.ctx = prevCtx; this.selfRef = prevSelf;
-    const builder = `function ($cls) {\nconst $self = $cls;\nconst $blk = null;\n${decls}\n${body}\n}`;
+    const builder = this.genClassBuilder(node.__scope, node.body, null);
     return `R.defineSingletonClass(${obj}, ${builder})`;
   }
 
   genSingletonMember(node, target) {
     if (node.type === 'Def') {
-      const prevMethod = this.methodName; this.methodName = node.name;
-      const scope = node.__scope; const prevScope = this.scope; const prevCtx = this.ctx; const prevClassRef = this.classRef; const prevSelf = this.selfRef;
-      this.scope = scope; this.ctx = ['method']; this.classRef = '$dc'; this.selfRef = '$self';
-      const bind = this.genParamBinding(node.params, false);
-      const body = this.genFnBody(node.body, scope, { wrapReturn: true });
-      this.scope = prevScope; this.ctx = prevCtx; this.classRef = prevClassRef; this.selfRef = prevSelf; this.methodName = prevMethod;
-      const fn = `function ($self, $args, $blk) {\n${bind}\n${body}\n}`;
+      const fn = this.genMethodFn(node);
       return `(($dc) => R.defineSMethod($dc, ${this.q(node.name)}, ${fn}))(${target});`;
     }
     if (node.type === 'Alias') {

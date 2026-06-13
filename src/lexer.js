@@ -138,12 +138,7 @@ export class Lexer {
     // %w[...] %i[...] word/symbol array literals (and %q/%Q strings).
     if (c === '%' && (this.prevAllowsValue() || this.spaceBefore)) {
       // …but after `def` or `.` a `%` is an operator-method name, not a literal
-      let j = this.tokens.length - 1;
-      while (j >= 0 && this.tokens[j].type === 'NEWLINE') j--;
-      const prev = j >= 0 ? this.tokens[j] : null;
-      const isDefName = prev && ((prev.type === 'KEYWORD' && prev.value === 'def') ||
-        (prev.type === 'OP' && prev.value === '.'));
-      if (!isDefName) {
+      if (!this.prevIsDefName()) {
         const k = this.peek(1);
         if ('wWiI'.includes(k) && this.isDelim(this.peek(2))) return this.scanWords(k);
         if ('qQ'.includes(k) && this.isDelim(this.peek(2))) return this.scanPercentString(k);
@@ -157,12 +152,7 @@ export class Lexer {
     if (c === '/' && (this.prevAllowsValue() ||
         (this.spaceBefore && this.peek(1) !== ' ' && this.peek(1) !== '=' && this.peek(1) !== undefined))) {
       // …but after `def` or `.` a slash is an operator-method name
-      let j = this.tokens.length - 1;
-      while (j >= 0 && this.tokens[j].type === 'NEWLINE') j--;
-      const prev = j >= 0 ? this.tokens[j] : null;
-      const isDefName = prev && ((prev.type === 'KEYWORD' && prev.value === 'def') ||
-        (prev.type === 'OP' && prev.value === '.'));
-      if (!isDefName) return this.scanRegex();
+      if (!this.prevIsDefName()) return this.scanRegex();
     }
 
     if (isDigit(c)) return this.scanNumber();
@@ -210,6 +200,23 @@ export class Lexer {
 
   atLineStart() {
     return this.pos === 0 || this.src[this.pos - 1] === '\n';
+  }
+
+  // After `def` or `.`, a following `%`/`/` is an operator-method name (e.g.
+  // `def %(x)`, `a.%(b)`), not the start of a literal.
+  prevIsDefName() {
+    let j = this.tokens.length - 1;
+    while (j >= 0 && this.tokens[j].type === 'NEWLINE') j--;
+    const prev = j >= 0 ? this.tokens[j] : null;
+    return !!(prev && ((prev.type === 'KEYWORD' && prev.value === 'def') ||
+      (prev.type === 'OP' && prev.value === '.')));
+  }
+
+  // Trailing regex flags after a /pattern/ or %r{pattern}.
+  scanRegexFlags() {
+    let flags = '';
+    while (this.peek() !== undefined && /[imxouesn]/.test(this.peek())) { flags += this.peek(); this.pos++; }
+    return flags;
   }
 
   scanNumber() {
@@ -493,8 +500,7 @@ export class Lexer {
       buf += c; this.pos++;
     }
     this.pos++; // consume closing /
-    let flags = '';
-    while (this.peek() !== undefined && /[imxouesn]/.test(this.peek())) { flags += this.peek(); this.pos++; }
+    const flags = this.scanRegexFlags();
     if (buf.length || parts.length === 0) parts.push({ str: buf });
     this.push('REGEX', { parts, flags });
   }
@@ -634,8 +640,7 @@ export class Lexer {
       if (c === '\n') this.line++;
       buf += c; this.pos++;
     }
-    let flags = '';
-    while (this.peek() !== undefined && /[imxouesn]/.test(this.peek())) { flags += this.peek(); this.pos++; }
+    const flags = this.scanRegexFlags();
     if (buf.length || parts.length === 0) parts.push({ str: buf });
     this.push('REGEX', { parts, flags });
   }
