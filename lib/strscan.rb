@@ -187,8 +187,11 @@ class StringScanner
     if pattern.is_a?(String)
       idx = r.index(pattern)
       return _clear_match unless idx
-      _set_match(@pos + idx, pattern, [pattern], [], nil)
-      r[0, idx + pattern.length]
+      # MRI: with a String pattern the whole scanned span (pos..end of match)
+      # becomes the match, so #matched is "foo bar" and #pre_match is "".
+      consumed = r[0, idx + pattern.length]
+      _set_match(@pos, consumed, [consumed], [], nil)
+      consumed
     else
       m = pattern.match(r)
       return _clear_match unless m

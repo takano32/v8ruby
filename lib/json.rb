@@ -274,7 +274,10 @@ module JSON
             out << hex.to_i(16)
             @pos += 6
           else
-            fail_at("invalid escape '\\#{e}'")
+            # MRI's parser is lenient with unknown escapes: it drops the
+            # backslash and keeps the following character (e.g. "\x" => "x").
+            out << e
+            @pos += 2
           end
         else
           fail_at("raw control character in string") if c.ord < 32
