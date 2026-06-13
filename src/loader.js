@@ -202,17 +202,24 @@ export function executeSource(src, path) {
 // Native extensions (.so/.bundle/.dll) can't be loaded by a JS runtime.
 const NATIVE_EXT = /\.(so|bundle|dll|dylib)$/;
 
+// Execute a resolved feature exactly once; record it in $LOADED_FEATURES.
+// Returns false (without re-running) if already loaded, so circular requires
+// terminate. The feature is marked loaded before executing for the same reason.
+function loadOnce(abs) {
+  if (loadedFeatures.has(abs)) return false;
+  loadedFeatures.add(abs);
+  R.gvarGet('$LOADED_FEATURES').push(R.str(abs));
+  executeFile(abs);
+  return true;
+}
+
 // ---- require family -------------------------------------------------------
 export function requireFeature(name) {
   if (NATIVE_EXT.test(name)) raiseLoadError(`cannot load such file -- ${name}`);
   let abs = resolveFeature(name);
   if (!abs && tryActivateFor(name)) abs = resolveFeature(name);
   if (!abs) raiseLoadError(`cannot load such file -- ${name}`);
-  if (loadedFeatures.has(abs)) return false;
-  loadedFeatures.add(abs); // before executing: circular requires return false
-  R.gvarGet('$LOADED_FEATURES').push(R.str(abs));
-  executeFile(abs);
-  return true;
+  return loadOnce(abs);
 }
 
 export function requireRelative(name) {
@@ -222,11 +229,7 @@ export function requireRelative(name) {
   }
   const abs = candidate(resolve(dirname(cur), name));
   if (!abs) raiseLoadError(`cannot load such file -- ${name}`);
-  if (loadedFeatures.has(abs)) return false;
-  loadedFeatures.add(abs);
-  R.gvarGet('$LOADED_FEATURES').push(R.str(abs));
-  executeFile(abs);
-  return true;
+  return loadOnce(abs);
 }
 
 export function loadFile(name) {
