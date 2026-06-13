@@ -40,7 +40,6 @@ class Set
   end
 
   def add(o)
-    check_frozen
     @hash[o] = true
     self
   end
@@ -51,21 +50,23 @@ class Set
   end
 
   def delete(o)
-    check_frozen
     @hash.delete(o)
     self
   end
 
   def delete_if(&block)
-    check_frozen
     to_a.each { |o| @hash.delete(o) if block.call(o) }
     self
   end
 
   def clear
-    check_frozen
-    @hash = {}
+    @hash.clear
     self
+  end
+
+  def freeze
+    @hash.freeze
+    super
   end
 
   def include?(o)
@@ -118,8 +119,9 @@ class Set
   alias difference -
 
   def ^(enum)
-    s = self.class.new(enum)
-    (self | s) - (self & s)
+    n = Set.new(enum)
+    each { |o| n.include?(o) ? n.delete(o) : n.add(o) }
+    n
   end
 
   def ==(other)
@@ -165,20 +167,11 @@ class Set
 
   def inspect
     items = to_a.map { |o| o.inspect }.join(", ")
-    # Ruby 4.x: plain Set prints Set[...]; subclasses keep the legacy format.
-    if self.class == Set
-      "Set[#{items}]"
-    else
-      "#<#{self.class}: {#{items}}>"
-    end
+    "#<#{self.class}: {#{items}}>"
   end
   alias to_s inspect
 
   private
-
-  def check_frozen
-    raise FrozenError, "can't modify frozen #{self.class}: #{inspect}" if frozen?
-  end
 
   def check_set(set)
     raise ArgumentError, "value must be a set" unless set.is_a?(Set)

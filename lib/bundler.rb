@@ -11,6 +11,21 @@ require "pathname"
 module Bundler
   VERSION = "0.1.0 (v8ruby shim)"
 
+  # Gems that ship with Ruby itself (default and bundled gems). They are always
+  # present in a real Ruby install, so a Gemfile.lock pinning them does not need
+  # a `bundle install`; never warn that these are "not installed".
+  DEFAULT_GEMS = %w[
+    abbrev base64 benchmark bigdecimal cgi csv date debug delegate did_you_mean
+    digest drb english erb etc fcntl fiddle fileutils find forwardable
+    getoptlong io-console io-nonblock io-wait ipaddr irb json logger matrix
+    minitest mutex_m net-ftp net-http net-imap net-pop net-protocol net-smtp
+    nkf observer open-uri open3 openssl optparse ostruct pathname pp power_assert
+    prettyprint prime prism pstore psych racc rake rdoc readline reline resolv
+    resolv-replace rexml rinda rss ruby2_keywords securerandom set shellwords
+    singleton stringio strscan syslog tempfile test-unit time timeout tmpdir
+    tsort typeprof un uri weakref yaml zlib
+  ].freeze
+
   class BundlerError < StandardError; end
   class GemfileNotFound < BundlerError; end
   class GemNotFound < BundlerError; end
@@ -96,6 +111,7 @@ module Bundler
     gems.each do |name, version|
       # strip platform suffixes like "1.2.3-x86_64-linux"
       v = version.sub(/-[a-z].*\z/, "")
+      next if DEFAULT_GEMS.include?(name)
       missing << "#{name} (#{version})" unless Gem.activate(name, v)
     end
     unless missing.empty?
