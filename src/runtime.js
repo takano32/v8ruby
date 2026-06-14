@@ -22,6 +22,8 @@ import { homedir } from 'node:os';
 
 // ---- core value classes ---------------------------------------------------
 class RFloat { constructor(v) { this.value = v; } }
+class RRational { constructor(num, den) { this.num = num; this.den = den; } }
+class RComplex { constructor(re, im) { this.re = re; this.im = im; } }
 class RString { constructor(s) { this.value = s; } }
 class RSymbol { constructor(name) { this.name = name; } }
 class RRange { constructor(from, to, exclusive) { this.from = from; this.to = to; this.exclusive = exclusive; } }
@@ -31,7 +33,7 @@ class RProc {
 // A (possibly infinite) lazy enumerator. genFn is a JS generator function
 // yielding Ruby values; pairs are yielded as JS arrays.
 class REnumerator {
-  constructor(genFn) { this.genFn = genFn; this._iter = null; }
+  constructor(genFn) { this.genFn = genFn; this._iter = null; this._lazy = false; }
   *[Symbol.iterator]() { yield* this.genFn(); }
 }
 class RRegexp {
@@ -201,6 +203,8 @@ ObjectC.includes.push(KernelC);
 const NumericC = defClass('Numeric', ObjectC);
 const IntegerC = defClass('Integer', NumericC);
 const FloatC = defClass('Float', NumericC);
+const RationalC = defClass('Rational', NumericC);
+const ComplexC = defClass('Complex', NumericC);
 const StringC = defClass('String', ObjectC);
 const SymbolC = defClass('Symbol', ObjectC);
 const ArrayC = defClass('Array', ObjectC);
@@ -212,6 +216,7 @@ const TrueClassC = defClass('TrueClass', ObjectC);
 const FalseClassC = defClass('FalseClass', ObjectC);
 const MathM = defClass('Math', null, true);
 const EnumeratorC = defClass('Enumerator', ObjectC);
+const LazyC = defClass('Enumerator::Lazy', EnumeratorC);
 EnumeratorC.includes.push(EnumerableC);
 const StructC = defClass('Struct', ObjectC);
 const RegexpC = defClass('Regexp', ObjectC);
@@ -261,13 +266,15 @@ function classOf(v) {
   const t = typeof v;
   if (t === 'number') return IntegerC;
   if (v instanceof RFloat) return FloatC;
+  if (v instanceof RRational) return RationalC;
+  if (v instanceof RComplex) return ComplexC;
   if (v instanceof RString) return v.rclass || StringC; // String subclasses
   if (v instanceof RSymbol) return SymbolC;
   if (Array.isArray(v)) return v.rclass || ArrayC;      // Array subclasses
   if (v instanceof RHash) return v.rclass || HashC;     // Hash subclasses
   if (v instanceof RRange) return RangeC;
   if (v instanceof RProc) return ProcC;
-  if (v instanceof REnumerator) return EnumeratorC;
+  if (v instanceof REnumerator) return v._lazy ? LazyC : EnumeratorC;
   if (v instanceof RRegexp) return RegexpC;
   if (v instanceof RClass) return v.isModule ? ModuleC : ClassC;
   if (v instanceof RObject) return v.rclass;
@@ -433,7 +440,7 @@ function rbEqual(a, b) {
 }
 
 function isNum(v) { return typeof v === 'number' || v instanceof RFloat; }
-function numVal(v) { return typeof v === 'number' ? v : v.value; }
+function numVal(v) { return typeof v === 'number' ? v : (v instanceof RRational ? v.num / v.den : v.value); }
 function isInt(v) { return typeof v === 'number'; }
 function mkfloat(v) { return new RFloat(v); }
 
@@ -455,6 +462,8 @@ function toS(v) {
   if (v === false) return 'false';
   if (typeof v === 'number') return String(v);
   if (v instanceof RFloat) return floatToS(v.value);
+  if (v instanceof RRational) return ratToS(v);
+  if (v instanceof RComplex) return cplxToS(v, false);
   if (v instanceof RString) return v.value;
   if (v instanceof RSymbol) return v.name;
   if (Array.isArray(v)) return inspect(v);
@@ -494,6 +503,8 @@ function inspect(v) {
   if (v === false) return 'false';
   if (typeof v === 'number') return String(v);
   if (v instanceof RFloat) return floatToS(v.value);
+  if (v instanceof RRational) return `(${ratToS(v)})`;
+  if (v instanceof RComplex) return cplxToS(v, true);
   if (v instanceof RString) return strInspect(v.value);
   if (v instanceof RSymbol) {
     // bare identifiers, operators, and `name=`/`name?`/`name!` print unquoted;
@@ -526,16 +537,17 @@ function inspect(v) {
   return String(v);
 }
 
+const STR_NAMED_ESC = { 7: '\\a', 8: '\\b', 9: '\\t', 10: '\\n', 11: '\\v', 12: '\\f', 13: '\\r', 27: '\\e' };
 function strInspect(s) {
+  const chars = [...s];
   let out = '"';
-  for (const ch of s) {
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i]; const cp = ch.codePointAt(0);
     if (ch === '"') out += '\\"';
     else if (ch === '\\') out += '\\\\';
-    else if (ch === '\n') out += '\\n';
-    else if (ch === '\t') out += '\\t';
-    else if (ch === '\r') out += '\\r';
-    else if (ch === '\0') out += '\\0';
-    else if (ch === '\x1b') out += '\\e';
+    else if (ch === '#' && (chars[i + 1] === '{' || chars[i + 1] === '$' || chars[i + 1] === '@')) out += '\\#';
+    else if (STR_NAMED_ESC[cp]) out += STR_NAMED_ESC[cp];
+    else if (cp < 0x20 || cp === 0x7f) out += '\\u' + cp.toString(16).toUpperCase().padStart(4, '0');
     else out += ch;
   }
   return out + '"';
@@ -587,7 +599,22 @@ function sprintf(fmt, args) {
         case 'd': case 'i': s = String(Math.trunc(numVal(arg))); break;
         case 'f': s = numVal(arg).toFixed(prec === undefined ? 6 : +prec); break;
         case 'e': s = numVal(arg).toExponential(prec === undefined ? 6 : +prec).replace(/e([+-])(\d)$/, 'e$10$2'); break;
-        case 'g': case 'G': s = String(numVal(arg)); break;
+        case 'g': case 'G': {
+          let p = prec === undefined ? 6 : +prec; if (p === 0) p = 1;
+          const v = numVal(arg);
+          if (v === 0) { s = '0'; }
+          else {
+            const exp = parseInt(v.toExponential().split('e')[1], 10);
+            if (exp < -4 || exp >= p) {
+              s = v.toExponential(p - 1).replace(/\.?0+e/, 'e').replace(/e([+-])(\d)$/, 'e$10$2');
+            } else {
+              s = v.toFixed(Math.max(0, p - 1 - exp));
+              if (s.indexOf('.') >= 0) s = s.replace(/\.?0+$/, '');
+            }
+          }
+          if (conv === 'G') s = s.toUpperCase();
+          break;
+        }
         case 's': s = toS(arg); if (prec !== undefined) s = s.slice(0, +prec); break;
         case 'x': s = Math.trunc(numVal(arg)).toString(16); break;
         case 'X': s = Math.trunc(numVal(arg)).toString(16).toUpperCase(); break;
@@ -597,8 +624,8 @@ function sprintf(fmt, args) {
         default: s = toS(arg);
       }
       const neg = s.startsWith('-');
-      if (flags.includes('+') && !neg && 'dif'.includes(conv)) s = '+' + s;
-      else if (flags.includes(' ') && !neg && 'dif'.includes(conv)) s = ' ' + s;
+      if (flags.includes('+') && !neg && 'difeEgG'.includes(conv)) s = '+' + s;
+      else if (flags.includes(' ') && !neg && 'difeEgG'.includes(conv)) s = ' ' + s;
       if (width) {
         const w = +width;
         if (flags.includes('-')) s = s.padEnd(w);
@@ -627,6 +654,8 @@ const R = {
   RFloat, RString, RSymbol, RRange, RProc, RObject, RClass, RHash,
   nil: null,
   float: (v) => new RFloat(v),
+  rational: (n, d) => mkRational(n, d),
+  complex: (re, im) => mkComplex(re, im),
   str: (s) => new RString(s),
   sym: (() => { const tbl = new Map(); return (n) => { let s = tbl.get(n); if (!s) { s = new RSymbol(n); tbl.set(n, s); } return s; }; })(),
   range: (from, to, excl) => new RRange(from, to, excl),
@@ -637,6 +666,8 @@ const R = {
   array: (a) => a,
   splat: (v) => toArray(v),
   main: mainObject,
+  patMatch: (value, d) => { const binds = {}; return patMatch(value, d, binds) ? binds : false; },
+  raisePatternError: (value) => raiseError(NoMatchingPatternErrorC, inspect(value)),
 
   // dispatch & control
   send, callBlock, makeProc, toProc, truthy, respondTo,
@@ -1062,6 +1093,8 @@ function destructure(value, count, splatIndex) {
 installKernel();
 installInteger();
 installFloat();
+installRational();
+installComplex();
 installNumeric();
 installString();
 installSymbol();
@@ -1073,6 +1106,7 @@ installNilTrueFalse();
 installComparable();
 installEnumerable();
 installEnumerator();
+installLazy();
 installModuleClass();
 installException();
 installMath();
@@ -1139,6 +1173,13 @@ function installKernel() {
     if (v instanceof RString) { const n = parseFloat(v.value); if (Number.isNaN(n)) raiseError(ArgumentErrorC, `invalid value for Float(): "${v.value}"`); return mkfloat(n); }
     raiseError(TypeErrorC, "can't convert to Float");
   });
+  def(ObjectC, 'Rational', (self, args) => {
+    const n = args[0]; const d = args[1] != null ? args[1] : 1;
+    if ((isInt(n) || n instanceof RRational) && (isInt(d) || d instanceof RRational)) { const rn = toRational(n), rd = toRational(d); return mkRational(rn.num * rd.den, rn.den * rd.num); }
+    if (n instanceof RString && args[1] == null) { const m = n.value.trim().match(/^(-?\d+)(?:\/(\d+))?$/); if (m) return mkRational(parseInt(m[1], 10), m[2] ? parseInt(m[2], 10) : 1); raiseError(ArgumentErrorC, `invalid value for convert(): "${n.value}"`); }
+    return floatToRational(numVal(n) / numVal(d));
+  });
+  def(ObjectC, 'Complex', (self, args) => mkComplex(args[0], args[1] != null ? args[1] : 0));
   def(ObjectC, 'String', (self, args) => new RString(toS(args[0])));
   def(ObjectC, 'Array', (self, args) => { const v = args[0]; if (v === null) return []; if (Array.isArray(v)) return v; return toArray(v); });
   def(ObjectC, 'gets', () => null);
@@ -1267,21 +1308,30 @@ function dupValue(self) {
 // ---- Integer --------------------------------------------------------------
 function installInteger() {
   const I = IntegerC;
-  def(I, '+', (s, a) => (isInt(a[0]) ? s + a[0] : numericOp(s, a[0], (x, y) => x + y)));
-  def(I, '-', (s, a) => (isInt(a[0]) ? s - a[0] : numericOp(s, a[0], (x, y) => x - y)));
-  def(I, '*', (s, a) => (isInt(a[0]) ? s * a[0] : numericOp(s, a[0], (x, y) => x * y)));
+  def(I, '+', (s, a) => (isInt(a[0]) ? s + a[0] : intCoerce(s, a[0], '+') ?? numericOp(s, a[0], (x, y) => x + y)));
+  def(I, '-', (s, a) => (isInt(a[0]) ? s - a[0] : intCoerce(s, a[0], '-') ?? numericOp(s, a[0], (x, y) => x - y)));
+  def(I, '*', (s, a) => (isInt(a[0]) ? s * a[0] : intCoerce(s, a[0], '*') ?? numericOp(s, a[0], (x, y) => x * y)));
   def(I, '/', (s, a) => {
     if (isInt(a[0])) { if (a[0] === 0) raiseError(ZeroDivisionErrorC, 'divided by 0'); return Math.floor(s / a[0]); }
+    { const c = intCoerce(s, a[0], '/'); if (c !== undefined) return c; }
     return mkfloat(s / numVal(a[0]));
   });
   def(I, '%', (s, a) => (isInt(a[0]) ? ((s % a[0]) + a[0]) % a[0] : mkfloat(jsmod(s, numVal(a[0])))));
   def(I, 'modulo', I.methods.get('%'));
   def(I, '**', (s, a) => (isInt(a[0]) && a[0] >= 0 ? Math.pow(s, a[0]) : mkfloat(Math.pow(s, numVal(a[0])))));
-  def(I, 'pow', I.methods.get('**'));
+  def(I, 'pow', (s, a) => {
+    if (a[1] != null) { // modular exponentiation: pow(exp, mod)
+      const m = BigInt(numVal(a[1])); if (m === 0n) raiseError(ZeroDivisionErrorC, 'divided by 0');
+      let base = ((BigInt(s) % m) + m) % m; let exp = BigInt(numVal(a[0])); let r = 1n;
+      while (exp > 0n) { if (exp & 1n) r = (r * base) % m; base = (base * base) % m; exp >>= 1n; }
+      return Number(((r % m) + m) % m);
+    }
+    return send(s, '**', [a[0]]);
+  });
   def(I, '-@', (s) => -s);
   def(I, '+@', (s) => s);
-  def(I, '<=>', (s, a) => (isNum(a[0]) ? cmpNum(s, a[0]) : null));
-  def(I, '==', (s, a) => isNum(a[0]) && s === numVal(a[0]));
+  def(I, '<=>', (s, a) => { const b = a[0]; if (b instanceof RRational) return send(mkRational(s, 1), '<=>', [b]); return isNum(b) ? cmpNum(s, b) : null; });
+  def(I, '==', (s, a) => { const b = a[0]; if (b instanceof RRational || b instanceof RComplex) return truthy(send(b, '==', [s])); return isNum(b) && s === numVal(b); });
   def(I, '<', (s, a) => s < numVal(a[0]));
   def(I, '>', (s, a) => s > numVal(a[0]));
   def(I, '<=', (s, a) => s <= numVal(a[0]));
@@ -1290,6 +1340,7 @@ function installInteger() {
   def(I, '|', (s, a) => s | a[0]);
   def(I, '^', (s, a) => s ^ a[0]);
   def(I, '~', (s) => ~s);
+  def(I, '[]', (s, a) => { const i = numVal(a[0]); if (i < 0) return 0; return Number((BigInt(s) >> BigInt(i)) & 1n); });
   def(I, '<<', (s, a) => s * Math.pow(2, a[0]));
   def(I, '>>', (s, a) => Math.floor(s / Math.pow(2, a[0])));
   def(I, 'times', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (let i = 0; i < s; i++) yield i; }); try { for (let i = 0; i < s; i++) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
@@ -1312,8 +1363,11 @@ function installInteger() {
   def(I, 'to_f', (s) => mkfloat(s));
   def(I, 'to_s', (s, a) => new RString(a && a[0] != null ? s.toString(numVal(a[0])) : String(s)));
   def(I, 'inspect', (s) => new RString(String(s)));
-  def(I, 'to_r', (s) => s);
-  def(I, 'to_c', (s) => s);
+  def(I, 'to_r', (s) => new RRational(s, 1));
+  def(I, 'rationalize', (s) => new RRational(s, 1));
+  def(I, 'numerator', (s) => s);
+  def(I, 'denominator', () => 1);
+  def(I, 'to_c', (s) => mkComplex(s, 0));
   def(I, 'chr', (s) => new RString(String.fromCharCode(s)));
   def(I, 'ord', (s) => s);
   def(I, 'floor', (s, a) => roundInt(s, a, 'floor'));
@@ -1338,6 +1392,12 @@ function installInteger() {
 
 function jsmod(a, b) { return ((a % b) + b) % b; }
 function gcd(a, b) { while (b) { [a, b] = [b, a % b]; } return a; }
+// Integer arithmetic with a Rational/Complex operand: promote self and re-dispatch.
+function intCoerce(s, b, op) {
+  if (b instanceof RRational) return send(mkRational(s, 1), op, [b]);
+  if (b instanceof RComplex) return send(mkComplex(s, 0), op, [b]);
+  return undefined;
+}
 function cmpNum(a, b) { const x = numVal(a), y = numVal(b); return x < y ? -1 : x > y ? 1 : 0; }
 function numericOp(a, b, f) {
   if (isNum(b)) { const r = f(numVal(a), numVal(b)); return (isInt(a) && isInt(b)) ? r : mkfloat(r); }
@@ -1363,10 +1423,10 @@ function brk(e) { if (e instanceof BreakError) return e.value; throw e; }
 // ---- Float ----------------------------------------------------------------
 function installFloat() {
   const F = FloatC;
-  def(F, '+', (s, a) => mkfloat(s.value + numVal(a[0])));
-  def(F, '-', (s, a) => mkfloat(s.value - numVal(a[0])));
-  def(F, '*', (s, a) => mkfloat(s.value * numVal(a[0])));
-  def(F, '/', (s, a) => mkfloat(s.value / numVal(a[0])));
+  def(F, '+', (s, a) => (a[0] instanceof RComplex ? send(mkComplex(s, 0), '+', [a[0]]) : mkfloat(s.value + numVal(a[0]))));
+  def(F, '-', (s, a) => (a[0] instanceof RComplex ? send(mkComplex(s, 0), '-', [a[0]]) : mkfloat(s.value - numVal(a[0]))));
+  def(F, '*', (s, a) => (a[0] instanceof RComplex ? send(mkComplex(s, 0), '*', [a[0]]) : mkfloat(s.value * numVal(a[0]))));
+  def(F, '/', (s, a) => (a[0] instanceof RComplex ? send(mkComplex(s, 0), '/', [a[0]]) : mkfloat(s.value / numVal(a[0]))));
   def(F, '%', (s, a) => mkfloat(jsmod(s.value, numVal(a[0]))));
   def(F, 'modulo', F.methods.get('%'));
   def(F, '**', (s, a) => mkfloat(Math.pow(s.value, numVal(a[0]))));
@@ -1383,6 +1443,9 @@ function installFloat() {
   def(F, 'to_i', (s) => Math.trunc(s.value));
   def(F, 'to_int', (s) => Math.trunc(s.value));
   def(F, 'to_f', (s) => s);
+  def(F, 'to_r', (s) => floatToRational(s.value));
+  def(F, 'rationalize', (s) => rationalizeFloat(s.value));
+  def(F, 'to_c', (s) => mkComplex(s, 0));
   def(F, 'to_s', (s) => new RString(floatToS(s.value)));
   def(F, 'inspect', (s) => new RString(floatToS(s.value)));
   def(F, 'floor', (s, a) => floatRound(s.value, a, Math.floor));
@@ -1409,6 +1472,123 @@ function floatRound(v, a, fn) {
   if (d === 0) return fn(v);
   const f = Math.pow(10, d);
   return mkfloat(fn(v * f) / f);
+}
+
+// ---- Rational / Complex ---------------------------------------------------
+function bigGcd(a, b) { a = a < 0n ? -a : a; b = b < 0n ? -b : b; while (b) { [a, b] = [b, a % b]; } return a || 1n; }
+function mkRational(num, den) {
+  if (den === 0) raiseError(ZeroDivisionErrorC, 'divided by 0');
+  if (den < 0) { num = -num; den = -den; }
+  const g = gcd(Math.abs(num), Math.abs(den)) || 1;
+  return new RRational(num / g, den / g);
+}
+// Exact IEEE-754 double -> Rational (matches MRI's Float#to_r for normal values).
+function floatToRational(f) {
+  if (!Number.isFinite(f)) raiseError(ArgumentErrorC, 'value out of range');
+  if (f === 0) return new RRational(0, 1);
+  const buf = new DataView(new ArrayBuffer(8)); buf.setFloat64(0, f);
+  const bits = buf.getBigUint64(0);
+  const sign = (bits >> 63n) & 1n; let exp = Number((bits >> 52n) & 0x7ffn); let mant = bits & 0xfffffffffffffn;
+  if (exp === 0) exp = -1074; else { mant |= 0x10000000000000n; exp -= 1075; }
+  let num = mant; let den = 1n;
+  if (exp >= 0) num <<= BigInt(exp); else den <<= BigInt(-exp);
+  if (sign) num = -num;
+  const g = bigGcd(num, den); num /= g; den /= g;
+  return new RRational(Number(num), Number(den));
+}
+function toRational(v) { if (v instanceof RRational) return v; if (isInt(v)) return new RRational(v, 1); if (v instanceof RFloat) return floatToRational(v.value); raiseError(TypeErrorC, `can't convert ${classOf(v).name} into Rational`); }
+// Float#rationalize: the simplest rational matching the float's shortest decimal.
+function rationalizeFloat(f) {
+  if (!Number.isFinite(f)) raiseError(ArgumentErrorC, 'value out of range');
+  if (Number.isInteger(f)) return new RRational(f, 1);
+  const str = String(f);
+  if (str.includes('e') || str.includes('E')) return floatToRational(f);
+  const [ip, fp] = str.split('.');
+  return mkRational(parseInt(ip + fp, 10), Math.pow(10, fp.length));
+}
+function mkComplex(re, im) { return new RComplex(re, im); }
+// Numeric "quo" division: Integer/Integer yields a Rational (like MRI), else `/`.
+function numQuo(x, d) { if (isInt(x) && isInt(d)) return x % d === 0 ? x / d : mkRational(x, d); return send(x, '/', [d]); }
+function toComplex(v) { return v instanceof RComplex ? v : mkComplex(v, 0); }
+function realZero(x) { return isInt(x) ? x === 0 : (x instanceof RFloat ? x.value === 0 : (x instanceof RRational ? x.num === 0 : false)); }
+function ratArith(s, b, op) {
+  if (b instanceof RFloat) return send(mkfloat(s.num / s.den), op, [b]);
+  if (b instanceof RComplex) return send(mkComplex(s, 0), op, [b]);
+  const r = toRational(b);
+  switch (op) {
+    case '+': return mkRational(s.num * r.den + r.num * s.den, s.den * r.den);
+    case '-': return mkRational(s.num * r.den - r.num * s.den, s.den * r.den);
+    case '*': return mkRational(s.num * r.num, s.den * r.den);
+    case '/': return mkRational(s.num * r.den, s.den * r.num);
+  }
+}
+function ratToS(s) { return `${s.num}/${s.den}`; }
+function installRational() {
+  const Ra = RationalC;
+  for (const op of ['+', '-', '*', '/']) def(Ra, op, (s, a) => ratArith(s, a[0], op));
+  def(Ra, '**', (s, a) => { const b = a[0]; if (isInt(b)) { if (b >= 0) return mkRational(Math.pow(s.num, b), Math.pow(s.den, b)); return mkRational(Math.pow(s.den, -b), Math.pow(s.num, -b)); } return mkfloat(Math.pow(s.num / s.den, numVal(b))); });
+  def(Ra, '-@', (s) => new RRational(-s.num, s.den));
+  def(Ra, '+@', (s) => s);
+  def(Ra, '<=>', (s, a) => { const b = a[0]; if (b instanceof RFloat) return cmpNum(mkfloat(s.num / s.den), b); if (b instanceof RRational || isInt(b)) { const r = toRational(b); const l = s.num * r.den, rr = r.num * s.den; return l < rr ? -1 : l > rr ? 1 : 0; } return null; });
+  def(Ra, '==', (s, a) => { const b = a[0]; if (b instanceof RRational) return s.num === b.num && s.den === b.den; if (isInt(b)) return s.den === 1 && s.num === b; if (b instanceof RFloat) return s.num / s.den === b.value; return false; });
+  def(Ra, 'abs', (s) => new RRational(Math.abs(s.num), s.den));
+  def(Ra, 'numerator', (s) => s.num);
+  def(Ra, 'denominator', (s) => s.den);
+  def(Ra, 'to_r', (s) => s);
+  def(Ra, 'rationalize', (s) => s);
+  def(Ra, 'to_f', (s) => mkfloat(s.num / s.den));
+  def(Ra, 'to_i', (s) => Math.trunc(s.num / s.den));
+  def(Ra, 'to_int', (s) => Math.trunc(s.num / s.den));
+  def(Ra, 'truncate', (s) => Math.trunc(s.num / s.den));
+  def(Ra, 'floor', (s, a) => (a && a[0] != null ? floatRound(s.num / s.den, a, Math.floor) : Math.floor(s.num / s.den)));
+  def(Ra, 'ceil', (s, a) => (a && a[0] != null ? floatRound(s.num / s.den, a, Math.ceil) : Math.ceil(s.num / s.den)));
+  def(Ra, 'round', (s, a) => (a && a[0] != null ? floatRound(s.num / s.den, a, Math.round) : Math.round(s.num / s.den)));
+  def(Ra, 'zero?', (s) => s.num === 0);
+  def(Ra, 'positive?', (s) => s.num > 0);
+  def(Ra, 'negative?', (s) => s.num < 0);
+  def(Ra, 'integer?', () => false);
+  def(Ra, 'coerce', (s, a) => { const b = a[0]; if (b instanceof RFloat) return [b, mkfloat(s.num / s.den)]; return [toRational(b), s]; });
+  def(Ra, 'to_s', (s) => new RString(ratToS(s)));
+  def(Ra, 'inspect', (s) => new RString(`(${ratToS(s)})`));
+  def(Ra, 'hash', (s) => (s.num * 31 + s.den) | 0);
+}
+function cplxToS(s, withParen) {
+  // MRI: components rendered via inspect (parenthesized) for #inspect, via to_s
+  // otherwise; a `*` precedes `i` when the imaginary string doesn't end in a digit.
+  const render = withParen ? inspect : toS;
+  const imNeg = truthy(send(s.im, 'negative?', []));
+  const imAbs = render(send(s.im, 'abs', []));
+  const star = /[0-9]$/.test(imAbs) ? '' : '*';
+  const body = `${render(s.re)}${imNeg ? '-' : '+'}${imAbs}${star}i`;
+  return withParen ? `(${body})` : body;
+}
+function installComplex() {
+  const Cx = ComplexC;
+  def(Cx, '+', (s, a) => { const b = toComplex(a[0]); return mkComplex(send(s.re, '+', [b.re]), send(s.im, '+', [b.im])); });
+  def(Cx, '-', (s, a) => { const b = toComplex(a[0]); return mkComplex(send(s.re, '-', [b.re]), send(s.im, '-', [b.im])); });
+  def(Cx, '*', (s, a) => { const b = toComplex(a[0]); return mkComplex(send(send(s.re, '*', [b.re]), '-', [send(s.im, '*', [b.im])]), send(send(s.re, '*', [b.im]), '+', [send(s.im, '*', [b.re])])); });
+  def(Cx, '/', (s, a) => { const b = toComplex(a[0]); const denom = send(send(b.re, '*', [b.re]), '+', [send(b.im, '*', [b.im])]); const re = numQuo(send(send(s.re, '*', [b.re]), '+', [send(s.im, '*', [b.im])]), denom); const im = numQuo(send(send(s.im, '*', [b.re]), '-', [send(s.re, '*', [b.im])]), denom); return mkComplex(re, im); });
+  def(Cx, '-@', (s) => mkComplex(send(s.re, '-@', []), send(s.im, '-@', [])));
+  def(Cx, '+@', (s) => s);
+  def(Cx, '==', (s, a) => { const b = a[0]; if (b instanceof RComplex) return truthy(send(s.re, '==', [b.re])) && truthy(send(s.im, '==', [b.im])); if (isNum(b) || b instanceof RRational) return realZero(s.im) && truthy(send(s.re, '==', [b])); return false; });
+  def(Cx, 'real', (s) => s.re);
+  def(Cx, 'imaginary', (s) => s.im);
+  def(Cx, 'imag', (s) => s.im);
+  def(Cx, 'conjugate', (s) => mkComplex(s.re, send(s.im, '-@', [])));
+  def(Cx, 'conj', Cx.methods.get('conjugate'));
+  def(Cx, 'abs', (s) => mkfloat(Math.hypot(numVal(s.re), numVal(s.im))));
+  def(Cx, 'magnitude', Cx.methods.get('abs'));
+  def(Cx, 'abs2', (s) => send(send(s.re, '*', [s.re]), '+', [send(s.im, '*', [s.im])]));
+  def(Cx, 'arg', (s) => mkfloat(Math.atan2(numVal(s.im), numVal(s.re))));
+  def(Cx, 'angle', Cx.methods.get('arg'));
+  def(Cx, 'phase', Cx.methods.get('arg'));
+  def(Cx, 'rectangular', (s) => [s.re, s.im]);
+  def(Cx, 'rect', Cx.methods.get('rectangular'));
+  def(Cx, 'to_c', (s) => s);
+  def(Cx, 'to_s', (s) => new RString(cplxToS(s, false)));
+  def(Cx, 'inspect', (s) => new RString(cplxToS(s, true)));
+  def(Cx, 'coerce', (s, a) => [toComplex(a[0]), s]);
+  def(Cx, 'hash', (s) => (numVal(s.re) * 31 + numVal(s.im)) | 0);
 }
 
 function installNumeric() {
@@ -1475,9 +1655,11 @@ function installString() {
   def(S, 'chars', (s) => [...s.value].map((c) => new RString(c)));
   def(S, 'bytes', (s) => [...Buffer.from(s.value, 'utf8')]);
   def(S, 'lines', (s) => { const parts = s.value.split(/(?<=\n)/); return parts.filter((p) => p.length).map((p) => new RString(p)); });
-  def(S, 'each_char', (s, a, blk) => { try { for (const c of s.value) safeYield(blk, [new RString(c)]); } catch (e) { return brk(e); } return s; });
-  def(S, 'each_line', (s, a, blk) => { try { for (const l of s.value.split(/(?<=\n)/)) if (l.length) safeYield(blk, [new RString(l)]); } catch (e) { return brk(e); } return s; });
-  def(S, 'each_byte', (s, a, blk) => { try { for (const b of Buffer.from(s.value, 'utf8')) safeYield(blk, [b]); } catch (e) { return brk(e); } return s; });
+  def(S, 'each_char', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (const c of s.value) yield new RString(c); }); try { for (const c of s.value) safeYield(blk, [new RString(c)]); } catch (e) { return brk(e); } return s; });
+  def(S, 'each_line', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (const l of s.value.split(/(?<=\n)/)) if (l.length) yield new RString(l); }); try { for (const l of s.value.split(/(?<=\n)/)) if (l.length) safeYield(blk, [new RString(l)]); } catch (e) { return brk(e); } return s; });
+  def(S, 'grapheme_clusters', (s) => graphemes(s.value).map((g) => new RString(g)));
+  def(S, 'each_grapheme_cluster', (s, a, blk) => { const gs = graphemes(s.value); if (!blk) return mkEnum(function* () { for (const g of gs) yield new RString(g); }); try { for (const g of gs) safeYield(blk, [new RString(g)]); } catch (e) { return brk(e); } return s; });
+  def(S, 'each_byte', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (const b of Buffer.from(s.value, 'utf8')) yield b; }); try { for (const b of Buffer.from(s.value, 'utf8')) safeYield(blk, [b]); } catch (e) { return brk(e); } return s; });
   def(S, 'split', (s, a) => strSplit(s.value, a));
   def(S, 'include?', (s, a) => s.value.includes(jsstr(a[0])));
   def(S, 'start_with?', (s, a) => a.some((x) => s.value.startsWith(jsstr(x))));
@@ -1507,7 +1689,13 @@ function installString() {
   def(S, 'delete', (s, a) => new RString(strTr(s.value, jsstr(a[0]), '')));
   def(S, 'delete!', (s, a) => { checkFrozen(s); const o = s.value; s.value = strTr(s.value, jsstr(a[0]), ''); return o === s.value ? null : s; });
   def(S, 'count', (s, a) => { const set = expandTr(jsstr(a[0])); let n = 0; for (const c of s.value) if (set.includes(c)) n++; return n; });
-  def(S, 'squeeze', (s) => new RString(s.value.replace(/(.)\1+/g, '$1')));
+  def(S, 'squeeze', (s, a) => {
+    if (a.length === 0) return new RString(s.value.replace(/(.)\1+/g, '$1'));
+    const set = expandTr(jsstr(a[0])); // chars eligible for squeezing
+    let out = ''; let prev = null;
+    for (const c of s.value) { if (c === prev && set.indexOf(c) >= 0) continue; out += c; prev = c; }
+    return new RString(out);
+  });
   def(S, 'squeeze!', (s) => { checkFrozen(s); const o = s.value; s.value = s.value.replace(/(.)\1+/g, '$1'); return o === s.value ? null : s; });
   def(S, 'to_i', (s, a) => { const base = a && a[0] != null ? numVal(a[0]) : 10; const re = base === 16 ? /^[-+]?[0-9a-fA-F]+/ : base === 2 ? /^[-+]?[01]+/ : base === 8 ? /^[-+]?[0-7]+/ : /^[-+]?\d+/; const m = s.value.trim().match(re); const n = m ? parseInt(m[0], base) : 0; return Number.isNaN(n) ? 0 : n; });
   def(S, 'to_f', (s) => { const m = s.value.trim().match(/^[-+]?\d*\.?\d+([eE][-+]?\d+)?/); return mkfloat(m ? parseFloat(m[0]) : 0); });
@@ -1545,25 +1733,31 @@ function installString() {
   def(S, 'b', (s) => new RString(s.value));
   def(S, 'scrub', (s, a) => new RString(s.value));
   def(S, 'unicode_normalize', (s) => new RString(s.value.normalize()));
-  def(S, 'unpack', () => []);
+  def(S, 'unpack', (s, a) => rbUnpack(s.value, jsstr(a[0])));
+  def(S, 'unpack1', (s, a) => { const r = rbUnpack(s.value, jsstr(a[0])); return r.length ? r[0] : null; });
   def(S, 'b', (s) => s);
 }
 
 function padStr(pad, len) { let out = ''; while (out.length < len) out += pad; return out.slice(0, len); }
 function strSplit(str, a) {
   if (a.length === 0 || a[0] === null) return str.trim().split(/\s+/).filter((x) => x.length).map((x) => new RString(x));
-  const sep = a[0]; const limit = a[1] != null ? numVal(a[1]) : -1;
+  const sep = a[0];
+  // limit omitted or 0 -> drop trailing empties; negative -> keep all; positive -> cap.
+  const limit = a[1] != null ? numVal(a[1]) : 0;
+  const dropTrailing = limit === 0;
   if (sep instanceof RRegexp) {
-    let parts = str.split(new RegExp(sep.re.source, sep.re.flags.replace('g', '')));
-    if (limit <= 0) { while (parts.length && parts[parts.length - 1] === '') parts.pop(); }
+    const re = new RegExp(sep.re.source, sep.re.flags.replace('g', ''));
+    let parts = limit > 0 ? str.split(re, undefined) : str.split(re);
+    if (limit > 0 && parts.length > limit) { const head = str.split(re); parts = head.slice(0, limit - 1); parts.push(head.slice(limit - 1).join('')); }
+    if (dropTrailing) { while (parts.length && parts[parts.length - 1] === '') parts.pop(); }
     return parts.map((p) => new RString(p == null ? '' : p));
   }
   if (sep instanceof RString && sep.value === ' ') return str.trim().split(/\s+/).filter((x) => x.length).map((x) => new RString(x));
   if (sep instanceof RString && sep.value === '') return [...str].map((c) => new RString(c));
   const sepStr = jsstr(sep);
   let parts = str.split(sepStr);
-  if (limit <= 0) { while (parts.length && parts[parts.length - 1] === '') parts.pop(); }
-  else if (parts.length > limit) parts = parts.slice(0, limit - 1).concat(parts.slice(limit - 1).join(sepStr));
+  if (limit > 0 && parts.length > limit) parts = parts.slice(0, limit - 1).concat(parts.slice(limit - 1).join(sepStr));
+  else if (dropTrailing) { while (parts.length && parts[parts.length - 1] === '') parts.pop(); }
   return parts.map((p) => new RString(p));
 }
 function strSub(str, a, blk, global) {
@@ -1581,9 +1775,30 @@ function strSub(str, a, blk, global) {
   });
   const rep = a[1];
   if (rep instanceof RHash) return str.replace(re, (m) => { const val = rep.get(new RString(m)); return val == null ? '' : toS(val); });
-  const repStr = jsstr(rep).replace(/\\(\d)/g, '$$$1');
-  return str.replace(re, repStr);
+  return str.replace(re, rubyReplToJs(jsstr(rep)));
 }
+// Translate a Ruby sub/gsub replacement string into a JS one. Ruby backrefs:
+// \1-\9 groups, \0 or \& whole match, \k<name> named, \` pre, \' post. A bare
+// `$` is literal in Ruby (escaped to `$$` for JS).
+function rubyReplToJs(rep) {
+  let out = '';
+  for (let i = 0; i < rep.length; i++) {
+    const c = rep[i];
+    if (c === '$') { out += '$$'; continue; }
+    if (c !== '\\') { out += c; continue; }
+    const n = rep[i + 1];
+    if (n === undefined) { out += '\\'; }
+    else if (n === '0' || n === '&') { out += '$&'; i++; }
+    else if (n >= '1' && n <= '9') { out += '$' + n; i++; }
+    else if (n === '`') { out += '$`'; i++; }
+    else if (n === "'") { out += "$'"; i++; }
+    else if (n === '\\') { out += '\\'; i++; }
+    else if (n === 'k' && rep[i + 2] === '<') { const close = rep.indexOf('>', i + 3); if (close >= 0) { out += '$<' + rep.slice(i + 3, close) + '>'; i = close; } else { out += '\\'; } }
+    else { out += n; i++; }
+  }
+  return out;
+}
+function graphemes(str) { return [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(str)].map((seg) => seg.segment); }
 function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 function strTr(str, from, to) {
   // A leading `^` negates the from-set (matches every char NOT listed).
@@ -1630,7 +1845,7 @@ function strSliceSet(s, a) {
   return a[a.length - 1];
 }
 function rangeToSlice(r, len) {
-  let st = numVal(r.from); if (st < 0) st += len;
+  let st = r.from === null ? 0 : numVal(r.from); if (st < 0) st += len;
   let en = r.to === null ? len : numVal(r.to); if (en < 0) en += len;
   if (!r.exclusive) en += 1;
   if (st < 0 || st > len) return [null, 0];
@@ -1694,7 +1909,7 @@ function installArray() {
   def(A, 'empty?', (s) => s.length === 0);
   def(A, 'each', (s, a, blk) => { if (!blk) return mkEnum(function* () { yield* s; }); const r = yieldEach(s, blk, (i) => callBlock(blk, [s[i]])); return r !== undefined ? r : s; });
   def(A, 'each_with_index', (s, a, blk) => { if (!blk) return mkEnum(function* () { let i = 0; for (const x of s) yield [x, i++]; }); const r = yieldEach(s, blk, (i) => callBlock(blk, [s[i], i])); return r !== undefined ? r : s; });
-  def(A, 'each_index', (s, a, blk) => { const r = yieldEach(s, blk, (i) => callBlock(blk, [i])); return r !== undefined ? r : s; });
+  def(A, 'each_index', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (let i = 0; i < s.length; i++) yield i; }); const r = yieldEach(s, blk, (i) => callBlock(blk, [i])); return r !== undefined ? r : s; });
   def(A, 'each_with_object', (s, a, blk) => { const obj = a[0]; try { for (const x of s) callBlock(blk, [x, obj]); } catch (e) { return brk(e); } return obj; });
   def(A, 'reverse_each', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (let i = s.length - 1; i >= 0; i--) yield s[i]; }); try { for (let i = s.length - 1; i >= 0; i--) callBlock(blk, [s[i]]); } catch (e) { return brk(e); } return s; });
   def(A, 'map', (s, a, blk) => { if (!blk) return mkEnum(function* () { yield* s; }); const out = []; try { for (const x of s) out.push(callBlock(blk, [x])); } catch (e) { return brk(e); } return out; });
@@ -1724,8 +1939,8 @@ function installArray() {
   def(A, 'all?', (s, a, blk) => (blk ? s.every((x) => truthy(callBlock(blk, [x]))) : (a.length ? s.every((x) => truthy(send(a[0], '===', [x]))) : s.every(truthy))));
   def(A, 'none?', (s, a, blk) => (blk ? !s.some((x) => truthy(callBlock(blk, [x]))) : !s.some(truthy)));
   def(A, 'one?', (s, a, blk) => { let n = 0; for (const x of s) if (blk ? truthy(callBlock(blk, [x])) : truthy(x)) n++; return n === 1; });
-  def(A, 'min', (s, a, blk) => (s.length ? s.reduce((m, x) => (cmpWith(x, m, blk) < 0 ? x : m)) : null));
-  def(A, 'max', (s, a, blk) => (s.length ? s.reduce((m, x) => (cmpWith(x, m, blk) > 0 ? x : m)) : null));
+  def(A, 'min', (s, a, blk) => { if (a[0] != null) return s.slice().sort((x, y) => cmpWith(x, y, blk)).slice(0, numVal(a[0])); return s.length ? s.reduce((m, x) => (cmpWith(x, m, blk) < 0 ? x : m)) : null; });
+  def(A, 'max', (s, a, blk) => { if (a[0] != null) return s.slice().sort((x, y) => cmpWith(y, x, blk)).slice(0, numVal(a[0])); return s.length ? s.reduce((m, x) => (cmpWith(x, m, blk) > 0 ? x : m)) : null; });
   def(A, 'min_by', (s, a, blk) => minMaxBy(s, blk, -1));
   def(A, 'max_by', (s, a, blk) => minMaxBy(s, blk, 1));
   def(A, 'minmax', (s) => [send(s, 'min', []), send(s, 'max', [])]);
@@ -1739,6 +1954,8 @@ function installArray() {
   def(A, 'group_by', (s, a, blk) => { const h = new RHash(); for (const x of s) { const k = callBlock(blk, [x]); if (!h.has(k)) h.set(k, []); h.get(k).push(x); } return h; });
   def(A, 'partition', (s, a, blk) => { const t = [], f = []; for (const x of s) (truthy(callBlock(blk, [x])) ? t : f).push(x); return [t, f]; });
   def(A, 'chunk_while', (s, a, blk) => { if (!s.length) return []; const out = [[s[0]]]; for (let i = 1; i < s.length; i++) { if (truthy(callBlock(blk, [s[i - 1], s[i]]))) out[out.length - 1].push(s[i]); else out.push([s[i]]); } return out; });
+  def(A, 'chunk', (s, a, blk) => { if (!blk) return mkEnum(function* () { yield* chunkArr(s, blk); }); return chunkArr(s, blk); });
+  def(A, 'each_entry', (s, a, blk) => { if (!blk) return mkEnum(function* () { yield* s; }); try { for (const x of s) safeYield(blk, [x]); } catch (e) { return brk(e); } return s; });
   def(A, 'tally', (s) => { const h = new RHash(); for (const x of s) h.set(x, (h.get(x) || 0) + 1); return h; });
   def(A, 'reverse', (s) => s.slice().reverse());
   def(A, 'reverse!', (s) => { checkFrozen(s); s.reverse(); return s; });
@@ -1782,8 +1999,10 @@ function installArray() {
   def(A, 'min', A.methods.get('min'));
   def(A, 'product', (s, a) => arrProduct([s, ...a]));
   def(A, 'combination', (s, a, blk) => { const res = combinations(s, numVal(a[0])); if (blk) { for (const c of res) callBlock(blk, [c]); return s; } return res; });
+  def(A, 'permutation', (s, a, blk) => { const res = permutations(s, a[0] != null ? numVal(a[0]) : undefined); if (blk) { for (const c of res) callBlock(blk, [c]); return s; } return res; });
+  def(A, 'slice_when', (s, a, blk) => { if (!s.length) return []; const out = [[s[0]]]; for (let i = 1; i < s.length; i++) { if (truthy(callBlock(blk, [s[i - 1], s[i]]))) out.push([s[i]]); else out[out.length - 1].push(s[i]); } return out; });
   def(A, 'transpose', (s) => (s.length === 0 ? [] : s[0].map((_, i) => s.map((row) => row[i]))));
-  def(A, 'pack', () => new RString(''));
+  def(A, 'pack', (s, a) => rbPack(s, jsstr(a[0])));
   def(A, '==', (s, a) => rbEqual(s, a[0]));
   def(A, 'eql?', (s, a) => rbEqual(s, a[0]));
   def(A, '<=>', (s, a) => (Array.isArray(a[0]) ? spaceship(s, a[0]) : null));
@@ -1798,7 +2017,7 @@ function installArray() {
   def(A, 'assoc', (s, a) => { for (const x of s) if (Array.isArray(x) && rbEqual(x[0], a[0])) return x; return null; });
   def(A, 'step', () => null);
   def(A, 'cycle', (s, a, blk) => { const n = a[0] != null ? numVal(a[0]) : Infinity; if (!blk) return mkEnum(function* () { if (s.length === 0) return; for (let c = 0; c < n; c++) yield* s; }); try { for (let c = 0; c < n; c++) for (const x of s) callBlock(blk, [x]); } catch (e) { return brk(e); } return null; });
-  def(A, 'lazy', (s) => s);
+  def(A, 'lazy', (s) => mkLazy(function* () { yield* s; }));
   def(A, 'force', (s) => s);
 }
 
@@ -1831,9 +2050,54 @@ function arrSet(s, a) {
 }
 function arrDig(s, a) { let cur = s; for (const k of a) { if (cur === null) return null; cur = send(cur, '[]', [k]); } return cur; }
 function flatten(arr, depth) { const out = []; for (const x of arr) { if (Array.isArray(x) && depth > 0) out.push(...flatten(x, depth - 1)); else out.push(x); } return out; }
+// pack/unpack: parse a template into [directive, count] tokens. count is a
+// number, '*' (greedy), or 1 (default). Whitespace and comments are skipped.
+function packTemplate(fmt) { const toks = []; const re = /([a-zA-Z@])\s*(\d+|\*)?/g; let m; while ((m = re.exec(fmt))) toks.push([m[1], m[2] === undefined ? 1 : (m[2] === '*' ? '*' : parseInt(m[2], 10))]); return toks; }
+function pushInt(bytes, val, size, little) { const b = []; let v = BigInt(val) & ((1n << BigInt(size * 8)) - 1n); for (let i = 0; i < size; i++) { b.push(Number(v & 0xffn)); v >>= 8n; } if (!little) b.reverse(); for (const x of b) bytes.push(x); }
+function rbPack(arr, fmt) {
+  const bytes = []; let ai = 0;
+  for (const [d, cnt] of packTemplate(fmt)) {
+    if ('aAZ'.includes(d)) { const str = arr[ai++]; const sv = str == null ? '' : jsstr(str); const buf = []; for (let i = 0; i < sv.length; i++) buf.push(sv.charCodeAt(i) & 0xff); let n = cnt === '*' ? buf.length + (d === 'Z' ? 1 : 0) : cnt; const pad = d === 'A' ? 0x20 : 0; for (let i = 0; i < n; i++) bytes.push(i < buf.length ? buf[i] : pad); continue; }
+    if ('Hh'.includes(d)) { const sv = jsstr(arr[ai++]); const n = cnt === '*' ? sv.length : cnt; for (let i = 0; i < n; i += 2) { const hi = parseInt(sv[i] || '0', 16) || 0; const lo = parseInt(sv[i + 1] || '0', 16) || 0; bytes.push(d === 'H' ? (hi << 4) | lo : (lo << 4) | hi); } continue; }
+    const count = cnt === '*' ? arr.length - ai : cnt;
+    for (let i = 0; i < count; i++) {
+      const v = arr[ai++];
+      switch (d) {
+        case 'C': case 'c': bytes.push(numVal(v) & 0xff); break;
+        case 'U': { for (const b of Buffer.from(String.fromCodePoint(numVal(v)), 'utf8')) bytes.push(b); break; }
+        case 's': case 'S': case 'v': pushInt(bytes, numVal(v), 2, true); break;
+        case 'n': pushInt(bytes, numVal(v), 2, false); break;
+        case 'l': case 'L': case 'V': pushInt(bytes, numVal(v), 4, true); break;
+        case 'N': pushInt(bytes, numVal(v), 4, false); break;
+        case 'Q': case 'q': pushInt(bytes, numVal(v), 8, true); break;
+        default: ai--; i = count; break;
+      }
+    }
+  }
+  return new RString(bytes.map((b) => String.fromCharCode(b)).join(''));
+}
+function readInt(bytes, off, size, little, signed) { let v = 0n; for (let i = 0; i < size; i++) { const b = BigInt(bytes[off + (little ? i : size - 1 - i)] || 0); v |= b << BigInt(i * 8); } if (signed && (v & (1n << BigInt(size * 8 - 1)))) v -= 1n << BigInt(size * 8); return Number(v); }
+function rbUnpack(str, fmt) {
+  // latin1 byte view: each JS char contributes one byte (consistent with rbPack).
+  const bytes = []; for (let i = 0; i < str.length; i++) bytes.push(str.charCodeAt(i) & 0xff);
+  const out = []; let pos = 0;
+  for (const [d, cnt] of packTemplate(fmt)) {
+    if ('aAZ'.includes(d)) { const n = cnt === '*' ? bytes.length - pos : cnt; const slice = bytes.slice(pos, pos + n); pos += n; let sv = slice.map((b) => String.fromCharCode(b)).join(''); if (d === 'A') sv = sv.replace(/[ \0]+$/, ''); else if (d === 'Z') { const z = sv.indexOf('\0'); if (z >= 0) sv = sv.slice(0, z); } out.push(new RString(sv)); continue; }
+    if (d === 'U') { const cps = [...str]; const n = cnt === '*' ? cps.length : cnt; for (let i = 0; i < n && i < cps.length; i++) out.push(cps[i].codePointAt(0)); continue; }
+    if ('Hh'.includes(d)) { const n = cnt === '*' ? (bytes.length - pos) * 2 : cnt; let hex = ''; for (let i = 0; i < n; i++) { const b = bytes[pos + (i >> 1)]; if (b === undefined) break; const nib = (i % 2 === 0) === (d === 'H') ? (b >> 4) : (b & 0xf); hex += nib.toString(16); } pos += Math.ceil(n / 2); out.push(new RString(hex)); continue; }
+    const sizes = { C: [1, 0, 0], c: [1, 0, 1], n: [2, 0, 0], v: [2, 1, 0], S: [2, 1, 0], s: [2, 1, 1], N: [4, 0, 0], V: [4, 1, 0], L: [4, 1, 0], l: [4, 1, 1], Q: [8, 1, 0], q: [8, 1, 1] };
+    const spec = sizes[d]; if (!spec) continue; const [size, little, signed] = spec;
+    const count = cnt === '*' ? Math.floor((bytes.length - pos) / size) : cnt;
+    for (let i = 0; i < count; i++) { if (pos + size > bytes.length && cnt !== '*') { out.push(null); continue; } out.push(readInt(bytes, pos, size, little, signed)); pos += size; }
+  }
+  return out;
+}
 function arrUniq(arr, blk) { const seen = new Set(); const out = []; for (const x of arr) { const k = hashKey(blk ? callBlock(blk, [x]) : x); if (!seen.has(k)) { seen.add(k); out.push(x); } } return out; }
 function arrProduct(arrays) { let result = [[]]; for (const arr of arrays) { const next = []; for (const combo of result) for (const item of arr) next.push([...combo, item]); result = next; } return result; }
 function combinations(arr, k) { if (k === 0) return [[]]; if (k > arr.length) return []; const out = []; const rec = (start, combo) => { if (combo.length === k) { out.push(combo.slice()); return; } for (let i = start; i < arr.length; i++) { combo.push(arr[i]); rec(i + 1, combo); combo.pop(); } }; rec(0, []); return out; }
+// Group consecutive elements sharing a block-computed key (MRI Enumerable#chunk).
+function chunkArr(arr, blk) { const out = []; let key, cur, started = false; for (const x of arr) { const k = callBlock(blk, [x]); if (started && rbEqual(k, key)) cur.push(x); else { if (started) out.push([key, cur]); key = k; cur = [x]; started = true; } } if (started) out.push([key, cur]); return out; }
+function permutations(arr, k) { if (k === undefined) k = arr.length; if (k < 0 || k > arr.length) return []; const out = []; const used = new Array(arr.length).fill(false); const cur = []; const rec = () => { if (cur.length === k) { out.push(cur.slice()); return; } for (let i = 0; i < arr.length; i++) { if (used[i]) continue; used[i] = true; cur.push(arr[i]); rec(); cur.pop(); used[i] = false; } }; rec(); return out; }
 
 // ---- Hash -----------------------------------------------------------------
 function installHash() {
@@ -1865,11 +2129,11 @@ function installHash() {
   def(H, 'size', (s) => s.size);
   def(H, 'count', (s, a, blk) => { if (blk) { let n = 0; for (const [k, v] of s.entries()) if (truthy(callBlock(blk, [k, v]))) n++; return n; } return s.size; });
   def(H, 'empty?', (s) => s.size === 0);
-  def(H, 'each', (s, a, blk) => { try { for (const [k, v] of [...s.entries()]) callBlock(blk, [k, v]); } catch (e) { return brk(e); } return s; });
+  def(H, 'each', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (const [k, v] of [...s.entries()]) yield [k, v]; }); try { for (const [k, v] of [...s.entries()]) callBlock(blk, [k, v]); } catch (e) { return brk(e); } return s; });
   def(H, 'each_pair', H.methods.get('each'));
-  def(H, 'each_key', (s, a, blk) => { try { for (const k of s.keys()) callBlock(blk, [k]); } catch (e) { return brk(e); } return s; });
-  def(H, 'each_value', (s, a, blk) => { try { for (const v of s.values()) callBlock(blk, [v]); } catch (e) { return brk(e); } return s; });
-  def(H, 'each_with_index', (s, a, blk) => { let i = 0; try { for (const [k, v] of s.entries()) callBlock(blk, [[k, v], i++]); } catch (e) { return brk(e); } return s; });
+  def(H, 'each_key', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (const k of s.keys()) yield k; }); try { for (const k of s.keys()) callBlock(blk, [k]); } catch (e) { return brk(e); } return s; });
+  def(H, 'each_value', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (const v of s.values()) yield v; }); try { for (const v of s.values()) callBlock(blk, [v]); } catch (e) { return brk(e); } return s; });
+  def(H, 'each_with_index', (s, a, blk) => { if (!blk) return mkEnum(function* () { let i = 0; for (const [k, v] of s.entries()) yield [[k, v], i++]; }); let i = 0; try { for (const [k, v] of s.entries()) callBlock(blk, [[k, v], i++]); } catch (e) { return brk(e); } return s; });
   def(H, 'each_with_object', (s, a, blk) => { const obj = a[0]; try { for (const [k, v] of s.entries()) callBlock(blk, [[k, v], obj]); } catch (e) { return brk(e); } return obj; });
   def(H, 'map', (s, a, blk) => { const out = []; for (const [k, v] of s.entries()) out.push(callBlock(blk, [k, v])); return out; });
   def(H, 'collect', H.methods.get('map'));
@@ -1877,6 +2141,8 @@ function installHash() {
   def(H, 'select', (s, a, blk) => { const h = new RHash(); for (const [k, v] of s.entries()) if (truthy(callBlock(blk, [k, v]))) h.set(k, v); return h; });
   def(H, 'filter', H.methods.get('select'));
   def(H, 'reject', (s, a, blk) => { const h = new RHash(); for (const [k, v] of s.entries()) if (!truthy(callBlock(blk, [k, v]))) h.set(k, v); return h; });
+  def(H, 'compact', (s) => { const h = new RHash(); for (const [k, v] of s.entries()) if (v !== null && v !== undefined) h.set(k, v); return h; });
+  def(H, 'compact!', (s) => { checkFrozen(s); let changed = false; for (const [k, v] of [...s.entries()]) if (v === null || v === undefined) { s.delete(k); changed = true; } return changed ? s : null; });
   def(H, 'filter_map', (s, a, blk) => { const out = []; for (const [k, v] of s.entries()) { const r = callBlock(blk, [k, v]); if (truthy(r)) out.push(r); } return out; });
   def(H, 'find', (s, a, blk) => { for (const [k, v] of s.entries()) if (truthy(callBlock(blk, [k, v]))) return [k, v]; return null; });
   def(H, 'detect', H.methods.get('find'));
@@ -1931,6 +2197,7 @@ function installHash() {
 function installRange() {
   const R_ = RangeC;
   def(R_, 'each', (s, a, blk) => { if (!blk) return mkEnum(function* () { yield* rangeToArray(s); }); try { for (const x of rangeToArray(s)) safeYield(blk, [x]); } catch (e) { return brk(e); } return s; });
+  def(R_, 'lazy', (s) => mkLazy(function* () { if (isInt(s.from)) { const end = s.to === null ? Infinity : numVal(s.to); for (let i = s.from; s.exclusive ? i < end : i <= end; i++) yield i; } else { yield* rangeToArray(s); } }));
   def(R_, 'to_a', (s) => rangeToArray(s));
   def(R_, 'to_ary', (s) => rangeToArray(s));
   def(R_, 'entries', (s) => rangeToArray(s));
@@ -1942,13 +2209,14 @@ function installRange() {
   def(R_, 'reject', (s, a, blk) => rangeToArray(s).filter((x) => !truthy(callBlock(blk, [x]))));
   def(R_, 'find', (s, a, blk) => { for (const x of rangeToArray(s)) if (truthy(callBlock(blk, [x]))) return x; return null; });
   def(R_, 'detect', R_.methods.get('find'));
-  def(R_, 'each_with_index', (s, a, blk) => { let i = 0; for (const x of rangeToArray(s)) callBlock(blk, [x, i++]); return s; });
+  def(R_, 'each_with_index', (s, a, blk) => { if (!blk) return mkEnum(function* () { let i = 0; for (const x of rangeToArray(s)) yield [x, i++]; }); let i = 0; for (const x of rangeToArray(s)) callBlock(blk, [x, i++]); return s; });
+  def(R_, 'chunk', (s, a, blk) => { if (!blk) return mkEnum(function* () { yield* chunkArr(rangeToArray(s), blk); }); return chunkArr(rangeToArray(s), blk); });
   def(R_, 'each_with_object', (s, a, blk) => { const obj = a[0]; for (const x of rangeToArray(s)) callBlock(blk, [x, obj]); return obj; });
   def(R_, 'include?', (s, a) => rangeInclude(s, a[0]));
   def(R_, 'member?', R_.methods.get('include?'));
   def(R_, 'cover?', R_.methods.get('include?'));
   def(R_, '===', R_.methods.get('include?'));
-  def(R_, 'first', (s, a) => (a[0] != null ? rangeToArray(s).slice(0, numVal(a[0])) : s.from));
+  def(R_, 'first', (s, a) => { if (a[0] == null) return s.from; const n = numVal(a[0]); if (isInt(s.from)) { const out = []; for (let i = s.from; out.length < n && (s.to === null || (s.exclusive ? i < s.to : i <= s.to)); i++) out.push(i); return out; } return rangeToArray(s).slice(0, n); });
   def(R_, 'last', (s, a) => (a[0] != null ? rangeToArray(s).slice(-numVal(a[0])) : s.to));
   def(R_, 'begin', (s) => s.from);
   def(R_, 'end', (s) => s.to);
@@ -1981,9 +2249,85 @@ function installRange() {
   def(R_, '==', (s, a) => rbEqual(s, a[0]));
 }
 function rangeInclude(s, x) {
-  if (isNum(x) && isNum(s.from)) { const v = numVal(x); const lo = numVal(s.from); const hi = s.to === null ? Infinity : numVal(s.to); return v >= lo && (s.exclusive ? v < hi : v <= hi); }
-  if (x instanceof RString && s.from instanceof RString) { return s.exclusive ? (x.value >= s.from.value && x.value < s.to.value) : (x.value >= s.from.value && x.value <= s.to.value); }
+  if (isNum(x) && (s.from === null || isNum(s.from)) && (s.to === null || isNum(s.to))) {
+    const v = numVal(x); const lo = s.from === null ? -Infinity : numVal(s.from); const hi = s.to === null ? Infinity : numVal(s.to);
+    return v >= lo && (s.exclusive ? v < hi : v <= hi);
+  }
+  if (x instanceof RString && (s.from === null || s.from instanceof RString) && (s.to === null || s.to instanceof RString)) {
+    const lo = s.from === null ? null : s.from.value; const hi = s.to === null ? null : s.to.value;
+    return (lo === null || x.value >= lo) && (hi === null || (s.exclusive ? x.value < hi : x.value <= hi));
+  }
   return false;
+}
+
+// ---- pattern matching (`case/in`) -----------------------------------------
+// Match `value` against descriptor `d`, recording bindings into `binds`.
+function patMatch(value, d, binds) {
+  switch (d.k) {
+    case 'val': return truthy(send(d.f(), '===', [value]));
+    case 'var': binds[d.n] = value; return true;
+    case 'bind': if (!patMatch(value, d.p, binds)) return false; binds[d.n] = value; return true;
+    case 'alt': for (const o of d.opts) if (patMatch(value, o, binds)) return true; return false;
+    case 'arr': return matchArrayPattern(value, d, binds);
+    case 'find': return matchFindPattern(value, d, binds);
+    case 'hash': return matchHashPattern(value, d, binds);
+  }
+  return false;
+}
+function patDeconstruct(value, constThunk) {
+  if (constThunk && !truthy(send(value, 'is_a?', [constThunk()]))) return null;
+  if (Array.isArray(value)) return value;
+  if (respondTo(value, 'deconstruct')) { const a = send(value, 'deconstruct', []); return Array.isArray(a) ? a : null; }
+  return null;
+}
+function matchArrayPattern(value, d, binds) {
+  const arr = patDeconstruct(value, d.c);
+  if (!arr) return false;
+  const need = d.pre.length + d.post.length;
+  if (d.hasRest ? arr.length < need : arr.length !== need) return false;
+  for (let i = 0; i < d.pre.length; i++) if (!patMatch(arr[i], d.pre[i], binds)) return false;
+  for (let i = 0; i < d.post.length; i++) if (!patMatch(arr[arr.length - d.post.length + i], d.post[i], binds)) return false;
+  if (d.hasRest && d.restName) binds[d.restName] = arr.slice(d.pre.length, arr.length - d.post.length);
+  return true;
+}
+function matchFindPattern(value, d, binds) {
+  const arr = patDeconstruct(value, d.c);
+  if (!arr) return false;
+  const m = d.mid.length;
+  for (let start = 0; start + m <= arr.length; start++) {
+    const tmp = {}; let ok = true;
+    for (let i = 0; i < m; i++) if (!patMatch(arr[start + i], d.mid[i], tmp)) { ok = false; break; }
+    if (ok) {
+      Object.assign(binds, tmp);
+      if (d.preName) binds[d.preName] = arr.slice(0, start);
+      if (d.postName) binds[d.postName] = arr.slice(start + m);
+      return true;
+    }
+  }
+  return false;
+}
+function matchHashPattern(value, d, binds) {
+  const keySyms = d.pairs.map((p) => R.sym(p.key));
+  const keysArg = d.restKind === 'rest' ? null : keySyms;
+  let h;
+  if (d.c && !truthy(send(value, 'is_a?', [d.c()]))) return false;
+  if (value instanceof RHash) h = value;
+  else if (respondTo(value, 'deconstruct_keys')) { const r = send(value, 'deconstruct_keys', [keysArg]); if (!(r instanceof RHash)) return false; h = r; }
+  else return false;
+  for (const p of d.pairs) {
+    const sym = R.sym(p.key);
+    if (!h.has(sym)) return false;
+    const v = h.get(sym);
+    if (p.val) { if (!patMatch(v, p.val, binds)) return false; }
+    else binds[p.key] = v;
+  }
+  if (d.restKind === 'nil') { if (h.size !== d.pairs.length) return false; }
+  else if (d.restKind === 'rest' && d.restName) {
+    const rest = new RHash(); const used = new Set(d.pairs.map((p) => hashKey(R.sym(p.key))));
+    for (const [k, vv] of h.entries()) if (!used.has(hashKey(k))) rest.set(k, vv);
+    binds[d.restName] = rest;
+  }
+  return true;
 }
 
 // ---- Proc -----------------------------------------------------------------
@@ -2071,9 +2415,39 @@ function installEnumerable() {
 }
 
 // ---- Enumerator -----------------------------------------------------------
+function mkLazy(genFn) { const e = new REnumerator(genFn); e._lazy = true; return e; }
+// Enumerator::Lazy: chainable transformations evaluated on demand, so they work
+// on infinite sequences. Each non-terminal op returns a new lazy enumerator.
+function installLazy() {
+  const L = LazyC;
+  def(L, 'lazy', (s) => s);
+  def(L, 'map', (s, a, blk) => mkLazy(function* () { for (const x of s) yield callBlock(blk, [x]); }));
+  def(L, 'collect', L.methods.get('map'));
+  def(L, 'flat_map', (s, a, blk) => mkLazy(function* () { for (const x of s) { const r = callBlock(blk, [x]); if (Array.isArray(r)) yield* r; else yield r; } }));
+  def(L, 'select', (s, a, blk) => mkLazy(function* () { for (const x of s) if (truthy(callBlock(blk, [x]))) yield x; }));
+  def(L, 'filter', L.methods.get('select'));
+  def(L, 'find_all', L.methods.get('select'));
+  def(L, 'reject', (s, a, blk) => mkLazy(function* () { for (const x of s) if (!truthy(callBlock(blk, [x]))) yield x; }));
+  def(L, 'filter_map', (s, a, blk) => mkLazy(function* () { for (const x of s) { const r = callBlock(blk, [x]); if (truthy(r)) yield r; } }));
+  def(L, 'take_while', (s, a, blk) => mkLazy(function* () { for (const x of s) { if (!truthy(callBlock(blk, [x]))) break; yield x; } }));
+  def(L, 'drop_while', (s, a, blk) => mkLazy(function* () { let dropping = true; for (const x of s) { if (dropping && truthy(callBlock(blk, [x]))) continue; dropping = false; yield x; } }));
+  def(L, 'take', (s, a) => { const n = numVal(a[0]); return mkLazy(function* () { let i = 0; if (n <= 0) return; for (const x of s) { yield x; if (++i >= n) break; } }); });
+  def(L, 'drop', (s, a) => { const n = numVal(a[0]); return mkLazy(function* () { let i = 0; for (const x of s) { if (i++ < n) continue; yield x; } }); });
+  def(L, 'with_index', (s, a, blk) => { const off = a[0] != null ? numVal(a[0]) : 0; if (blk) return mkLazy(function* () { let i = off; for (const x of s) yield callBlock(blk, [x, i++]); }); return mkLazy(function* () { let i = off; for (const x of s) yield [x, i++]; }); });
+  def(L, 'each_with_index', (s, a, blk) => send(s, 'with_index', [0], blk));
+  def(L, 'uniq', (s, a, blk) => mkLazy(function* () { const seen = new Set(); for (const x of s) { const k = hashKey(blk ? callBlock(blk, [x]) : x); if (!seen.has(k)) { seen.add(k); yield x; } } }));
+  def(L, 'zip', (s, a) => mkLazy(function* () { const others = a.map((o) => toArray(o)); let i = 0; for (const x of s) { yield [x, ...others.map((o) => (i < o.length ? o[i] : null))]; i++; } }));
+  // terminals
+  def(L, 'first', (s, a) => { if (a[0] == null) { for (const x of s) return x; return null; } const n = numVal(a[0]); const out = []; if (n <= 0) return out; for (const x of s) { out.push(x); if (out.length >= n) break; } return out; });
+  def(L, 'force', (s) => [...s]);
+  def(L, 'to_a', (s) => [...s]);
+  def(L, 'each', (s, a, blk) => { if (!blk) return s; try { for (const x of s) callBlock(blk, Array.isArray(x) ? x : [x]); } catch (e) { return brk(e); } return s; });
+}
+
 function installEnumerator() {
   const E = EnumeratorC;
   const pull = (s, n) => { const out = []; for (const x of s) { out.push(x); if (out.length >= n) break; } return out; };
+  def(E, 'lazy', (s) => mkLazy(function* () { yield* s; }));
   def(E, 'each', (s, a, blk) => { if (!blk) return s; try { for (const x of s) callBlock(blk, Array.isArray(x) ? x : [x]); } catch (e) { return brk(e); } return s; });
   def(E, 'next', (s) => { if (!s._iter) s._iter = s.genFn(); const r = s._iter.next(); if (r.done) raiseError(StopIterationC, 'iteration reached an end'); return r.value; });
   def(E, 'peek', (s) => { if (!s._iter) s._iter = s.genFn(); if (s._peeked === undefined) { const r = s._iter.next(); if (r.done) raiseError(StopIterationC, 'iteration reached an end'); s._peeked = r.value; } return s._peeked; });

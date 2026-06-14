@@ -149,6 +149,21 @@ function analyze(node, scope) {
       analyze(node.elseBody, scope);
       return;
     }
+    case 'CaseMatch': {
+      analyze(node.subject, scope);
+      for (const cl of node.ins) {
+        declarePattern(cl.pattern, scope);
+        analyze(cl.guard, scope);
+        analyze(cl.body, scope);
+      }
+      analyze(node.elseBody, scope);
+      return;
+    }
+    case 'MatchPred': case 'MatchAssign': {
+      analyze(node.subject, scope);
+      declarePattern(node.pattern, scope);
+      return;
+    }
     case 'Begin': {
       analyze(node.body, scope);
       for (const r of node.rescues) {
@@ -176,12 +191,67 @@ function declareTarget(scope, t) {
   else analyze(t, scope);
 }
 
+// Declare every variable a pattern binds, and analyze its embedded expressions.
+function declarePattern(pat, scope) {
+  if (!pat) return;
+  switch (pat.type) {
+    case 'PVar': declareLocal(scope, pat.name); break;
+    case 'PBind': declareLocal(scope, pat.name); declarePattern(pat.pattern, scope); break;
+    case 'PAlt': pat.options.forEach((o) => declarePattern(o, scope)); break;
+    case 'PArr':
+      pat.pre.forEach((x) => declarePattern(x, scope));
+      pat.post.forEach((x) => declarePattern(x, scope));
+      if (pat.restName) declareLocal(scope, pat.restName);
+      if (pat.constExpr) analyze(pat.constExpr, scope);
+      break;
+    case 'PFind':
+      pat.mid.forEach((x) => declarePattern(x, scope));
+      if (pat.preName) declareLocal(scope, pat.preName);
+      if (pat.postName) declareLocal(scope, pat.postName);
+      if (pat.constExpr) analyze(pat.constExpr, scope);
+      break;
+    case 'PHash':
+      for (const pr of pat.pairs) { if (pr.value) declarePattern(pr.value, scope); else declareLocal(scope, pr.key); }
+      if (pat.rest && pat.rest.name) declareLocal(scope, pat.rest.name);
+      if (pat.constExpr) analyze(pat.constExpr, scope);
+      break;
+    case 'PVal': case 'PPin': analyze(pat.expr, scope); break;
+  }
+}
+
 function analyzeBlock(block, scope) {
+  // Implicit block parameters (`_1`..`_9`, `it`) when no explicit params: turn
+  // them into real positional params so the normal binding (incl. auto-splat
+  // of a single array arg into `_1`/`_2`/...) applies.
+  if (!block.params || block.params.length === 0) {
+    const found = findImplicitParams(block.body);
+    if (found.max > 0) block.params = Array.from({ length: found.max }, (_, i) => ({ kind: 'req', name: '_' + (i + 1) }));
+    else if (found.it) block.params = [{ kind: 'req', name: 'it' }];
+  }
   const params = collectParamNames(block.params);
   const s = new Scope('block', scope, params);
   block.__scope = s;
   analyzeParams(block.params, s);
   analyze(block.body, s);
+}
+
+// Scan a block body for implicit-parameter references, without descending into
+// nested scopes (each block/lambda/def has its own `_1`/`it`).
+function findImplicitParams(node, acc = { max: 0, it: false }) {
+  if (node == null || typeof node !== 'object') return acc;
+  if (Array.isArray(node)) { for (const n of node) findImplicitParams(n, acc); return acc; }
+  if (node.type === 'Ident') {
+    if (/^_[1-9]$/.test(node.name)) acc.max = Math.max(acc.max, +node.name[1]);
+    else if (node.name === 'it') acc.it = true;
+    return acc;
+  }
+  if (['Lambda', 'Def', 'Class', 'Module', 'SingletonClass'].includes(node.type)) return acc;
+  for (const k of Object.keys(node)) {
+    if (k === 'type' || k.startsWith('__')) continue;
+    if ((node.type === 'Call' || node.type === 'Super') && k === 'block') continue;
+    findImplicitParams(node[k], acc);
+  }
+  return acc;
 }
 
 function analyzeParams(params, scope) {
@@ -257,6 +327,7 @@ export class Compiler {
       case 'While': return this.genWhileStmt(node);
       case 'For': return this.genForStmt(node);
       case 'Case': return this.genCaseStmt(node);
+      case 'CaseMatch': return this.genCaseMatchStmt(node);
       case 'Begin': return this.genBeginStmt(node);
       case 'Return': return this.genReturn(node);
       case 'Break': return this.genBreak(node);
@@ -303,6 +374,7 @@ export class Compiler {
       case 'Next': return this.genNext(node);
       case 'If': return this.genIfReturn(node);
       case 'Case': return this.genCaseReturn(node);
+      case 'CaseMatch': return this.genCaseMatchReturn(node);
       case 'Begin': return 'return ' + this.gen(node) + ';';
       case 'While': return this.genWhileStmt(node) + '\nreturn null;';
       case 'For': return this.genForStmt(node) + '\nreturn null;';
@@ -317,6 +389,9 @@ export class Compiler {
     switch (node.type) {
       case 'IntLit': return String(node.value);
       case 'FloatLit': return `R.float(${node.value})`;
+      case 'MatchPred': case 'MatchAssign': return this.genMatchOp(node);
+      case 'RationalLit': return `R.rational(${node.num}, ${node.den})`;
+      case 'ImaginaryLit': return `R.complex(0, ${node.rational ? `R.rational(${node.num}, ${node.den})` : (node.isFloat ? `R.float(${node.value})` : String(node.value))})`;
       case 'StrLit': return this.genStr(node);
       case 'SymLit': return `R.sym(${this.q(node.name)})`;
       case 'DSym': return `R.sym(R.interp(${this.gen(node.str)}))`;
@@ -342,12 +417,13 @@ export class Compiler {
       case 'Logical': return this.genLogical(node);
       case 'UnaryOp': return this.genUnary(node);
       case 'Not': return `R.not(${this.gen(node.operand)})`;
-      case 'Range': return `R.range(${this.gen(node.from)}, ${node.to ? this.gen(node.to) : 'null'}, ${node.exclusive})`;
+      case 'Range': return `R.range(${node.from ? this.gen(node.from) : 'null'}, ${node.to ? this.gen(node.to) : 'null'}, ${node.exclusive})`;
       case 'Ternary': return `(R.truthy(${this.gen(node.cond)}) ? ${this.gen(node.then)} : ${this.gen(node.else)})`;
       case 'Call': return this.genCall(node);
       case 'Index': return `R.send(${this.gen(node.receiver)}, "[]", [${this.genArgs(node.args)}])`;
       case 'If': return this.genIfExpr(node);
       case 'Case': return this.genCaseExpr(node);
+      case 'CaseMatch': return this.genCaseMatchExpr(node);
       case 'While': return this.genWhileExpr(node);
       case 'Begin': return this.genBeginExpr(node);
       case 'Def': return this.genDef(node);
@@ -651,6 +727,74 @@ export class Compiler {
   genCaseStmt(node) { return this.caseToJs(node, false); }
   genCaseReturn(node) { return this.caseToJs(node, true); }
   genCaseExpr(node) { return `(() => {\n${this.caseToJs(node, true)}\n})()`; }
+
+  // ---- pattern matching (`case/in`) ---------------------------------------
+  genCaseMatchStmt(node) { return `(() => {\n${this.caseMatchToJs(node, false)}\n})();`; }
+  genCaseMatchReturn(node) { return this.caseMatchToJs(node, true); }
+  genCaseMatchExpr(node) { return `(() => {\n${this.caseMatchToJs(node, true)}\n})()`; }
+
+  caseMatchToJs(node, ret) {
+    const emit = (body) => (ret ? this.genReturningBody(body) : `${this.genStmts(body)}\nreturn;`);
+    const sv = this.t(); const bv = this.t();
+    let out = `const ${sv} = ${this.gen(node.subject)};\nlet ${bv};\n`;
+    for (const cl of node.ins) {
+      const names = [...new Set(this.collectBinds(cl.pattern))];
+      const assign = names.map((n) => `${this.local(n)} = ${bv}[${this.q(n)}] ?? null;`).join(' ');
+      out += `if ((${bv} = R.patMatch(${sv}, ${this.genPat(cl.pattern)}, {})) !== false) {\n${assign}\n`;
+      if (cl.guard) {
+        const g = cl.guardKind === 'unless' ? `!R.truthy(${this.gen(cl.guard)})` : `R.truthy(${this.gen(cl.guard)})`;
+        out += `if (${g}) {\n${emit(cl.body)}\n}\n`;
+      } else {
+        out += `${emit(cl.body)}\n`;
+      }
+      out += `}\n`;
+    }
+    if (node.elseBody) out += `${emit(node.elseBody)}\n`;
+    else out += `R.raisePatternError(${sv});\n`;
+    return out;
+  }
+
+  genMatchOp(node) {
+    const sv = this.t(); const bv = this.t();
+    const names = [...new Set(this.collectBinds(node.pattern))];
+    const assign = names.map((n) => `${this.local(n)} = ${bv}[${this.q(n)}] ?? null;`).join(' ');
+    const match = `const ${sv} = ${this.gen(node.subject)};\nlet ${bv} = R.patMatch(${sv}, ${this.genPat(node.pattern)}, {});`;
+    if (node.type === 'MatchPred') {
+      return `(() => {\n${match}\nif (${bv} === false) return false;\n${assign}\nreturn true;\n})()`;
+    }
+    return `(() => {\n${match}\nif (${bv} === false) R.raisePatternError(${sv});\n${assign}\nreturn null;\n})()`;
+  }
+
+  genPat(p) {
+    const cThunk = (cp) => (cp ? `() => ${this.gen(cp)}` : 'null');
+    switch (p.type) {
+      case 'PVal': case 'PPin': return `{k:"val",f:() => ${this.gen(p.expr)}}`;
+      case 'PVar': return `{k:"var",n:${this.q(p.name)}}`;
+      case 'PBind': return `{k:"bind",n:${this.q(p.name)},p:${this.genPat(p.pattern)}}`;
+      case 'PAlt': return `{k:"alt",opts:[${p.options.map((o) => this.genPat(o)).join(',')}]}`;
+      case 'PArr': return `{k:"arr",pre:[${p.pre.map((x) => this.genPat(x)).join(',')}],hasRest:${!!p.hasRest},restName:${p.restName ? this.q(p.restName) : 'null'},post:[${p.post.map((x) => this.genPat(x)).join(',')}],c:${cThunk(p.constExpr)}}`;
+      case 'PFind': return `{k:"find",preName:${p.preName ? this.q(p.preName) : 'null'},mid:[${p.mid.map((x) => this.genPat(x)).join(',')}],postName:${p.postName ? this.q(p.postName) : 'null'},c:${cThunk(p.constExpr)}}`;
+      case 'PHash': {
+        const pairs = p.pairs.map((pr) => `{key:${this.q(pr.key)},val:${pr.value ? this.genPat(pr.value) : 'null'}}`).join(',');
+        const restKind = p.rest === undefined ? '"none"' : (p.rest === null ? '"nil"' : '"rest"');
+        const restName = (p.rest && p.rest.name) ? this.q(p.rest.name) : 'null';
+        return `{k:"hash",pairs:[${pairs}],restKind:${restKind},restName:${restName},c:${cThunk(p.constExpr)}}`;
+      }
+    }
+    throw new Error('Cannot compile pattern: ' + p.type);
+  }
+
+  collectBinds(p) {
+    switch (p.type) {
+      case 'PVar': return [p.name];
+      case 'PBind': return [p.name, ...this.collectBinds(p.pattern)];
+      case 'PAlt': return p.options.flatMap((o) => this.collectBinds(o));
+      case 'PArr': { const b = [...p.pre, ...p.post].flatMap((x) => this.collectBinds(x)); if (p.restName) b.push(p.restName); return b; }
+      case 'PFind': { const b = p.mid.flatMap((x) => this.collectBinds(x)); if (p.preName) b.push(p.preName); if (p.postName) b.push(p.postName); return b; }
+      case 'PHash': { const b = []; for (const pr of p.pairs) { if (pr.value) b.push(...this.collectBinds(pr.value)); else b.push(pr.key); } if (p.rest && p.rest.name) b.push(p.rest.name); return b; }
+      default: return [];
+    }
+  }
 
   caseToJs(node, ret) {
     const emit = (body) => (ret ? this.genReturningBody(body) : this.genStmts(body));
