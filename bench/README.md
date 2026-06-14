@@ -8,7 +8,7 @@ Run them yourself:
 for f in bench/*.rb; do
   echo "== $f =="
   time ruby "$f"
-  time node bin/v8ruby.js "$f"
+  time node bin/ruby.js "$f"
 done
 ```
 

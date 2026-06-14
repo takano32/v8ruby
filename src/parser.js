@@ -27,7 +27,7 @@ const ASSIGN_OPS = new Set([
 
 // Tokens that can begin a command-call argument (paren-less call).
 const ARG_START_TYPES = new Set([
-  'INT', 'FLOAT', 'STRING', 'SYMBOL', 'IDENT', 'CONST', 'IVAR', 'CVAR', 'GVAR',
+  'INT', 'FLOAT', 'RATIONAL', 'IMAGINARY', 'STRING', 'SYMBOL', 'IDENT', 'CONST', 'IVAR', 'CVAR', 'GVAR',
   'LABEL', 'WORDS', 'REGEX',
 ]);
 
@@ -110,23 +110,27 @@ export class Parser {
   parseStatement() {
     let node = this.tryMultiAssign();
     if (!node) node = this.parseExpression();
+    // one-line pattern matching: `expr => pattern` (match or raise) and
+    // `expr in pattern` (boolean). Both also bind pattern variables.
+    if (this.atKw('in')) { this.advance(); node = N('MatchPred', { subject: node, pattern: this.parsePatternTop() }); }
+    else if (this.atOp('=>')) { this.advance(); node = N('MatchAssign', { subject: node, pattern: this.parsePatternTop() }); }
     // statement modifiers: EXPR if COND / unless / while / until / rescue
     while (true) {
-      if (this.atKw('if')) {
+      if (this.atKw("if")) {
         this.advance();
-        const cond = this.parseExpression();
-        node = N('If', { cond, then: [node], elifs: [], elseBody: null });
-      } else if (this.atKw('unless')) {
+        const cond = this.parseCondition();
+        node = N("If", { cond, then: [node], elifs: [], elseBody: null });
+      } else if (this.atKw("unless")) {
         this.advance();
-        const cond = this.parseExpression();
+        const cond = this.parseCondition();
         node = N('If', { cond: N('Not', { operand: cond }), then: [node], elifs: [], elseBody: null });
-      } else if (this.atKw('while')) {
+      } else if (this.atKw("while")) {
         this.advance();
-        const cond = this.parseExpression();
+        const cond = this.parseCondition();
         node = N('While', { cond, body: [node], isUntil: false, doWhile: this.isBeginBlock(node) });
-      } else if (this.atKw('until')) {
+      } else if (this.atKw("until")) {
         this.advance();
-        const cond = this.parseExpression();
+        const cond = this.parseCondition();
         node = N('While', { cond, body: [node], isUntil: true, doWhile: this.isBeginBlock(node) });
       } else if (this.atKw('rescue')) {
         this.advance();
@@ -225,6 +229,14 @@ export class Parser {
   // ---- expression precedence ladder --------------------------------------
   parseExpression() { return this.parseKwOr(); }
 
+  // A condition that may end with a one-line pattern match (`cond in pat` / `=>`).
+  parseCondition() {
+    const node = this.parseExpression();
+    if (this.atKw('in')) { this.advance(); return N('MatchPred', { subject: node, pattern: this.parsePatternTop() }); }
+    if (this.atOp('=>')) { this.advance(); return N('MatchAssign', { subject: node, pattern: this.parsePatternTop() }); }
+    return node;
+  }
+
   parseKwOr() {
     let left = this.parseKwAnd();
     while (this.atKw('or')) {
@@ -284,6 +296,13 @@ export class Parser {
   }
 
   parseRange() {
+    // beginless range: `..5` / `...5` (no left operand)
+    if (this.atOp('..') || this.atOp('...')) {
+      const exclusive = this.cur().value === '...';
+      this.advance();
+      const right = this.parseBinary(0);
+      return N('Range', { from: null, to: right, exclusive });
+    }
     let left = this.parseBinary(0);
     if (this.atOp('..') || this.atOp('...')) {
       const exclusive = this.cur().value === '...';
@@ -651,6 +670,8 @@ export class Parser {
     switch (t.type) {
       case 'INT': this.advance(); return N('IntLit', { value: t.value });
       case 'FLOAT': this.advance(); return N('FloatLit', { value: t.value });
+      case 'RATIONAL': this.advance(); return N('RationalLit', { num: t.value.num, den: t.value.den });
+      case 'IMAGINARY': this.advance(); return N('ImaginaryLit', t.value);
       case 'STRING': {
         this.advance();
         // Adjacent string literals concatenate: "a" "b" (often across `\` line
@@ -906,7 +927,7 @@ export class Parser {
 
   parseIf(isUnless) {
     this.advance(); // if/unless
-    let cond = this.parseExpression();
+    let cond = this.parseCondition();
     if (isUnless) cond = N('Not', { operand: cond });
     this.acceptThen();
     const then = this.parseStatements(() =>
@@ -915,7 +936,7 @@ export class Parser {
     let elseBody = null;
     while (this.atKw('elsif')) {
       this.advance();
-      const c = this.parseExpression();
+      const c = this.parseCondition();
       this.acceptThen();
       const b = this.parseStatements(() =>
         this.atKw('elsif') || this.atKw('else') || this.atKw('end'));
@@ -940,7 +961,7 @@ export class Parser {
 
   parseWhile(isUntil) {
     this.advance();
-    const cond = this.parseExpression();
+    const cond = this.parseCondition();
     this.acceptDo();
     const body = this.parseStatements(() => this.atKw('end'));
     this.expectKw('end');
@@ -963,8 +984,9 @@ export class Parser {
   parseCase() {
     this.advance();
     let subject = null;
-    if (!this.atType('NEWLINE') && !this.atKw('when')) subject = this.parseExpression();
+    if (!this.atType('NEWLINE') && !this.atKw('when') && !this.atKw('in')) subject = this.parseExpression();
     this.skipTerminators();
+    if (this.atKw('in')) return this.parseCaseMatch(subject);
     const whens = [];
     while (this.atKw('when')) {
       this.advance();
@@ -987,6 +1009,154 @@ export class Parser {
   parseWhenCond() {
     if (this.atOp('*')) { this.advance(); return N('Splat', { value: this.parseAssign() }); }
     return this.parseAssign();
+  }
+
+  // ---- pattern matching (`case/in`) ----------------------------------------
+  parseCaseMatch(subject) {
+    const ins = [];
+    while (this.atKw('in')) {
+      this.advance();
+      const pattern = this.parsePatternTop();
+      let guard = null, guardKind = null;
+      if (this.atKw('if')) { this.advance(); guardKind = 'if'; guard = this.parseExpression(); }
+      else if (this.atKw('unless')) { this.advance(); guardKind = 'unless'; guard = this.parseExpression(); }
+      this.acceptThen();
+      const body = this.parseStatements(() => this.atKw('in') || this.atKw('else') || this.atKw('end'));
+      ins.push({ pattern, guard, guardKind, body });
+    }
+    let elseBody = null;
+    if (this.atKw('else')) { this.advance(); elseBody = this.parseStatements(() => this.atKw('end')); }
+    this.expectKw('end');
+    return N('CaseMatch', { subject, ins, elseBody });
+  }
+
+  patternListEnds() {
+    return this.atKw('then') || this.atType('NEWLINE') || this.atKw('if') || this.atKw('unless') ||
+      this.atOp(']') || this.atOp(')') || this.atOp('}') || this.atOp('|') || this.atEOF() || this.atOp(';');
+  }
+
+  parsePatternTop() {
+    const elems = [this.parsePatternElem()];
+    let isArray = !!elems[0].__splat;
+    while (this.atOp(',')) {
+      this.advance(); this.skipNL();
+      isArray = true;
+      if (this.patternListEnds()) break;
+      elems.push(this.parsePatternElem());
+    }
+    if (!isArray) return elems[0];
+    return this.buildArrayPattern(elems);
+  }
+
+  parsePatternElem() {
+    if (this.atOp('*')) { this.advance(); let name = null; if (this.atType('IDENT')) name = this.advance().value; return { __splat: true, name }; }
+    return this.parsePattern1();
+  }
+
+  // A full sub-pattern: alternatives (`|`) then an optional `=> name` binding.
+  // `=>` binds looser than `|`, so `"a" | "b" => x` binds the whole alternative.
+  parsePattern1() {
+    const p = this.parsePatternAlt();
+    if (this.atOp('=>')) { this.advance(); return N('PBind', { pattern: p, name: this.expectType('IDENT').value }); }
+    return p;
+  }
+
+  buildArrayPattern(elems) {
+    const splatIdx = []; elems.forEach((e, i) => { if (e.__splat) splatIdx.push(i); });
+    if (splatIdx.length >= 2) {
+      const a = splatIdx[0], b = splatIdx[splatIdx.length - 1];
+      return N('PFind', { preName: elems[a].name, mid: elems.slice(a + 1, b), postName: elems[b].name });
+    }
+    if (splatIdx.length === 1) {
+      const i = splatIdx[0];
+      return N('PArr', { pre: elems.slice(0, i), restName: elems[i].name, hasRest: true, post: elems.slice(i + 1) });
+    }
+    return N('PArr', { pre: elems, restName: null, hasRest: false, post: [] });
+  }
+
+  parsePatternAlt() {
+    const p = this.parsePatternPrimary();
+    if (this.atOp('|')) {
+      const options = [p];
+      while (this.atOp('|')) { this.advance(); this.skipNL(); options.push(this.parsePatternPrimary()); }
+      return N('PAlt', { options });
+    }
+    return p;
+  }
+
+  parsePatternPrimary() {
+    if (this.atOp('[')) { this.advance(); this.skipNL(); return this.buildArrayPattern(this.parsePatternSeq(']')); }
+    if (this.atOp('{')) { this.advance(); this.skipNL(); const hp = this.parseHashPatternBody('}'); this.expectOp('}'); return hp; }
+    if (this.atOp('^')) {
+      this.advance();
+      if (this.atOp('(')) { this.advance(); this.skipNL(); const e = this.parseExpression(); this.skipNL(); this.expectOp(')'); return N('PPin', { expr: e }); }
+      return N('PPin', { expr: this.parsePrimary() });
+    }
+    if (this.atType('CONST')) return this.parseConstPattern();
+    if (this.atType('IDENT')) return N('PVar', { name: this.advance().value });
+    return this.parsePatternValue();
+  }
+
+  parsePatternSeq(closing) {
+    const elems = [];
+    while (!this.atOp(closing)) {
+      elems.push(this.parsePatternElem());
+      this.skipNL();
+      if (this.atOp(',')) { this.advance(); this.skipNL(); } else break;
+    }
+    this.skipNL();
+    this.expectOp(closing);
+    return elems;
+  }
+
+  parseConstPattern() {
+    let constExpr = N('Const', { name: this.advance().value });
+    while (this.atOp('::') && this.peek() && this.peek().type === 'CONST') { this.advance(); constExpr = N('ConstPath', { base: constExpr, name: this.advance().value }); }
+    if (this.atOp('(') && !this.cur().spaceBefore) {
+      this.advance(); this.skipNL();
+      let pat;
+      if (this.atType('LABEL') || this.atOp('**')) { pat = this.parseHashPatternBody(')'); this.expectOp(')'); }
+      else { pat = this.buildArrayPattern(this.parsePatternSeq(')')); }
+      pat.constExpr = constExpr; return pat;
+    }
+    if (this.atOp('[') && !this.cur().spaceBefore) {
+      this.advance(); this.skipNL();
+      const pat = this.buildArrayPattern(this.parsePatternSeq(']'));
+      pat.constExpr = constExpr; return pat;
+    }
+    return N('PVal', { expr: constExpr });
+  }
+
+  parseHashPatternBody(closing) {
+    const pairs = []; let rest; // undefined: none, null: **nil, {name}: **rest
+    while (!this.atOp(closing)) {
+      if (this.atOp('**')) {
+        this.advance();
+        if (this.atKw('nil')) { this.advance(); rest = null; }
+        else if (this.atType('IDENT')) rest = { name: this.advance().value };
+        else rest = { name: null };
+      } else {
+        const key = this.expectType('LABEL').value;
+        let value = null;
+        if (!this.atOp(',') && !this.atOp(closing)) value = this.parsePattern1();
+        pairs.push({ key, value });
+      }
+      this.skipNL();
+      if (this.atOp(',')) { this.advance(); this.skipNL(); } else break;
+    }
+    this.skipNL();
+    return N('PHash', { pairs, rest });
+  }
+
+  parsePatternValue() {
+    if (this.atOp('..') || this.atOp('...')) { const exclusive = this.cur().value === '...'; this.advance(); return N('PVal', { expr: N('Range', { from: null, to: this.parseUnary(), exclusive }) }); }
+    const left = this.parseUnary();
+    if (this.atOp('..') || this.atOp('...')) {
+      const exclusive = this.cur().value === '...'; this.advance();
+      const right = this.patternListEnds() ? null : this.parseUnary();
+      return N('PVal', { expr: N('Range', { from: left, to: right, exclusive }) });
+    }
+    return N('PVal', { expr: left });
   }
 
   parseDef() {

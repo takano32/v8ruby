@@ -249,6 +249,25 @@ export class Lexer {
       while (isDigit(this.peek())) this.pos++;
     }
     const text = this.src.slice(start, this.pos).replace(/_/g, '');
+    // Rational (`2r`, `3.5r`) and imaginary (`1i`, `2.0i`, `3ri`) suffixes.
+    let suf = '';
+    if (this.peek() === 'r') suf += 'r';
+    if (this.peek(suf.length) === 'i') suf += 'i';
+    const after = this.peek(suf.length);
+    if (suf && (after === undefined || !/[a-zA-Z0-9_]/.test(after))) {
+      this.pos += suf.length;
+      const rational = suf.includes('r');
+      const imaginary = suf.includes('i');
+      let num = 0, den = 1;
+      if (rational) {
+        if (text.includes('.')) { const [ip, fp] = text.split('.'); den = Math.pow(10, fp.length); num = parseInt(ip + fp, 10); }
+        else { num = parseInt(text, 10); den = 1; }
+      }
+      const value = isFloat ? parseFloat(text) : parseInt(text, 10);
+      if (imaginary) this.push('IMAGINARY', { rational, num, den, value, isFloat });
+      else this.push('RATIONAL', { num, den });
+      return;
+    }
     this.push(isFloat ? 'FLOAT' : 'INT', isFloat ? parseFloat(text) : parseInt(text, 10));
   }
 
