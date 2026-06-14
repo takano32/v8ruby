@@ -42,10 +42,10 @@ point, `R.send(recv, name, args, block)`, so Ruby semantics are preserved:
 ## Usage
 
 ```sh
-bin/v8ruby.js program.rb        # run a file
-bin/v8ruby.js -e 'puts 1 + 1'   # run a one-liner
-bin/v8ruby.js --dump program.rb # print the generated JavaScript
-bin/v8ruby.js -v                # version (shows the underlying V8 version)
+bin/ruby.js program.rb        # run a file
+bin/ruby.js -e 'puts 1 + 1'   # run a one-liner
+bin/ruby.js --dump program.rb # print the generated JavaScript
+bin/ruby.js -v                # version (shows the underlying V8 version)
 ```
 
 (No build step and no dependencies — just Node.js.)

@@ -4,7 +4,7 @@
   "description": "A Ruby implementation that compiles Ruby to JavaScript and runs it on the V8 engine",
   "type": "module",
   "bin": {
-    "v8ruby": "./bin/v8ruby.js"
+    "v8ruby": "./bin/ruby.js"
   },
   "scripts": {
     "test": "node test/run.js"
