@@ -324,6 +324,8 @@ export class Parser {
     while (true) {
       const t = this.cur();
       if (t.type !== 'OP' || !(t.value in BINPREC)) break;
+      // Inside block parameters (`|a, b=1|`), `|` closes the list — never an operator.
+      if (this.inBlockParams && t.value === '|') break;
       const prec = BINPREC[t.value];
       if (prec < minPrec) break;
       this.advance();
@@ -610,7 +612,10 @@ export class Parser {
     this.skipNL();
     if (!this.atOp('|')) return [];
     this.advance();
+    const prev = this.inBlockParams;
+    this.inBlockParams = true;
     const params = this.parseParamList(() => this.atOp('|'));
+    this.inBlockParams = prev;
     this.expectOp('|');
     return params;
   }

@@ -146,7 +146,7 @@ function hashKey(k) {
   if (k === null) return 'nil';
   if (k === true) return 'true';
   if (k === false) return 'false';
-  if (typeof k === 'number') return 'i:' + k;
+  if (typeof k === 'number' || typeof k === 'bigint') return 'i:' + k;
   if (k instanceof RFloat) return 'f:' + k.value;
   if (k instanceof RString) return 's:' + k.value;
   if (k instanceof RSymbol) return 'y:' + k.name;
@@ -219,6 +219,8 @@ const EnumeratorC = defClass('Enumerator', ObjectC);
 const LazyC = defClass('Enumerator::Lazy', EnumeratorC);
 EnumeratorC.includes.push(EnumerableC);
 const StructC = defClass('Struct', ObjectC);
+const EncodingC = defClass('Encoding', ObjectC);
+const ENCODING_CACHE = new Map();
 const RegexpC = defClass('Regexp', ObjectC);
 const MatchDataC = defClass('MatchData', ObjectC);
 NumericC.includes.push(ComparableC);
@@ -264,7 +266,7 @@ function classOf(v) {
   if (v === true) return TrueClassC;
   if (v === false) return FalseClassC;
   const t = typeof v;
-  if (t === 'number') return IntegerC;
+  if (t === 'number' || t === 'bigint') return IntegerC;
   if (v instanceof RFloat) return FloatC;
   if (v instanceof RRational) return RationalC;
   if (v instanceof RComplex) return ComplexC;
@@ -381,7 +383,13 @@ function respondTo(recv, name) {
 let DEFAULT_RTM = null; // captured after Kernel install
 
 // ---- block / proc helpers -------------------------------------------------
-function makeProc(fn, isLambda) { return new RProc(fn, isLambda); }
+function makeProc(fn, isLambda, arity) { const p = new RProc(fn, isLambda); if (typeof arity === 'number') p.arity = arity; else if (arity) p._ai = arity; return p; }
+// Arity from a stored param shape {n, v, o}, honouring proc-vs-lambda rules at
+// call time (a brace block's optional positional only counts once it's a lambda).
+function procArityOf(p) {
+  if (p._ai) { const { n, v, o } = p._ai; return (v || (o && p.isLambda)) ? -(n + 1) : n; }
+  return p.arity != null ? p.arity : -1;
+}
 function mkEnum(genFn) { return new REnumerator(genFn); }
 
 function callBlock(block, args, self) {
@@ -403,7 +411,7 @@ function toProc(v) {
   if (v === null) return null;
   if (v instanceof RProc) return v;
   if (v instanceof RSymbol) {
-    return makeProc((args) => send(args[0], v.name, args.slice(1)));
+    return makeProc((args) => send(args[0], v.name, args.slice(1)), false, -2);
   }
   if (respondTo(v, 'to_proc')) return send(v, 'to_proc', []);
   raiseError(TypeErrorC, 'no implicit conversion to Proc');
@@ -439,10 +447,47 @@ function rbEqual(a, b) {
   return false;
 }
 
-function isNum(v) { return typeof v === 'number' || v instanceof RFloat; }
-function numVal(v) { return typeof v === 'number' ? v : (v instanceof RRational ? v.num / v.den : v.value); }
-function isInt(v) { return typeof v === 'number'; }
+function isNum(v) { return typeof v === 'number' || typeof v === 'bigint' || v instanceof RFloat; }
+function numVal(v) { return typeof v === 'number' ? v : typeof v === 'bigint' ? Number(v) : (v instanceof RRational ? v.num / v.den : v.value); }
+function isInt(v) { return typeof v === 'number' || typeof v === 'bigint'; }
 function mkfloat(v) { return new RFloat(v); }
+// Bignum support: integers are JS numbers while they fit safely, and BigInt
+// beyond that. `fixnum` demotes a BigInt back to a number when it fits again.
+const BIG_MIN = BigInt(Number.MIN_SAFE_INTEGER);
+const BIG_MAX = BigInt(Number.MAX_SAFE_INTEGER);
+function fixnum(b) { return (b >= BIG_MIN && b <= BIG_MAX) ? Number(b) : b; }
+function asBig(v) { return typeof v === 'bigint' ? v : BigInt(v); }
+function bigFloorDiv(x, y) { let q = x / y; if ((x % y !== 0n) && ((x < 0n) !== (y < 0n))) q -= 1n; return q; }
+function gcdBig(a, b) { a = a < 0n ? -a : a; b = b < 0n ? -b : b; while (b) { [a, b] = [b, a % b]; } return a; }
+// Parse a sign+digits string in the given base to a number, promoting to BigInt
+// beyond safe-integer range. `digits` excludes the sign.
+function parseDigits(sign, digits, base) {
+  const n = parseInt(digits, base);
+  if (Number.isSafeInteger(n)) return sign === '-' ? -n : n;
+  const b = BigInt(base); let big = 0n;
+  for (const ch of digits) big = big * b + BigInt(parseInt(ch, base));
+  return fixnum(sign === '-' ? -big : big);
+}
+function intCmp(s, b) {
+  if (typeof s === 'bigint' || typeof b === 'bigint') {
+    if (isInt(b)) { const x = asBig(s), y = asBig(b); return x < y ? -1 : x > y ? 1 : 0; }
+  }
+  const x = numVal(s), y = numVal(b); return x < y ? -1 : x > y ? 1 : 0;
+}
+// Integer op with automatic fixnum<->bignum promotion. `numOp` runs in JS
+// numbers (fast path); if the result isn't a safe integer, `bigOp` reruns it in
+// BigInt. Mixed/float/rational operands fall through to coercion.
+function intArith(s, b, numOp, bigOp, opName) {
+  if (b instanceof RRational || b instanceof RComplex) return intCoerce(s, b, opName);
+  if (b instanceof RFloat) return mkfloat(numOp(numVal(s), b.value));
+  if (!isInt(b)) return numericOp(s, b, numOp);
+  if (typeof s === 'number' && typeof b === 'number') {
+    const r = numOp(s, b);
+    if (Number.isSafeInteger(r)) return r;
+    return fixnum(bigOp(BigInt(s), BigInt(b)));
+  }
+  return fixnum(bigOp(asBig(s), asBig(b)));
+}
 
 // ---- to_s / inspect -------------------------------------------------------
 // Ruby's Regexp#to_s: (?on-off:source) with flags ordered m,i,x — used when a
@@ -460,7 +505,7 @@ function toS(v) {
   if (v instanceof RRegexp) return regexpToS(v);
   if (v === true) return 'true';
   if (v === false) return 'false';
-  if (typeof v === 'number') return String(v);
+  if (typeof v === 'number' || typeof v === 'bigint') return String(v);
   if (v instanceof RFloat) return floatToS(v.value);
   if (v instanceof RRational) return ratToS(v);
   if (v instanceof RComplex) return cplxToS(v, false);
@@ -501,11 +546,11 @@ function inspect(v) {
   if (v === null || v === undefined) return 'nil';
   if (v === true) return 'true';
   if (v === false) return 'false';
-  if (typeof v === 'number') return String(v);
+  if (typeof v === 'number' || typeof v === 'bigint') return String(v);
   if (v instanceof RFloat) return floatToS(v.value);
   if (v instanceof RRational) return `(${ratToS(v)})`;
   if (v instanceof RComplex) return cplxToS(v, true);
-  if (v instanceof RString) return strInspect(v.value);
+  if (v instanceof RString) return strInspect(v.value, v.enc === 'ASCII-8BIT');
   if (v instanceof RSymbol) {
     // bare identifiers, operators, and `name=`/`name?`/`name!` print unquoted;
     // anything else (spaces, etc.) is quoted like a string
@@ -538,7 +583,9 @@ function inspect(v) {
 }
 
 const STR_NAMED_ESC = { 7: '\\a', 8: '\\b', 9: '\\t', 10: '\\n', 11: '\\v', 12: '\\f', 13: '\\r', 27: '\\e' };
-function strInspect(s) {
+function strInspect(s, binary) {
+  // UTF-8 strings escape control chars as \uXXXX; binary (ASCII-8BIT) strings
+  // escape control and high bytes as \xHH (matching MRI's two inspect styles).
   const chars = [...s];
   let out = '"';
   for (let i = 0; i < chars.length; i++) {
@@ -547,7 +594,8 @@ function strInspect(s) {
     else if (ch === '\\') out += '\\\\';
     else if (ch === '#' && (chars[i + 1] === '{' || chars[i + 1] === '$' || chars[i + 1] === '@')) out += '\\#';
     else if (STR_NAMED_ESC[cp]) out += STR_NAMED_ESC[cp];
-    else if (cp < 0x20 || cp === 0x7f) out += '\\u' + cp.toString(16).toUpperCase().padStart(4, '0');
+    else if (cp < 0x20 || cp === 0x7f) out += (binary ? '\\x' + cp.toString(16).toUpperCase().padStart(2, '0') : '\\u' + cp.toString(16).toUpperCase().padStart(4, '0'));
+    else if (binary && cp >= 0x80) out += '\\x' + cp.toString(16).toUpperCase().padStart(2, '0');
     else out += ch;
   }
   return out + '"';
@@ -580,7 +628,13 @@ function spaceship(a, b) {
 function raiseError(cls, message) {
   const obj = new RObject(cls);
   obj.ivars['@message'] = new RString(message);
+  setCause(obj);
   throw new RubyError(obj);
+}
+// Set an exception's #cause to the currently-handled exception ($!), if any.
+function setCause(obj) {
+  const cur = gvars['$!'];
+  if (cur != null && cur !== obj && obj instanceof RObject && obj.ivars['@__cause'] === undefined) obj.ivars['@__cause'] = cur;
 }
 function excMessage(obj) {
   if (obj instanceof RObject && obj.ivars['@message'] != null) return jsstr(obj.ivars['@message']);
@@ -596,7 +650,7 @@ function sprintf(fmt, args) {
       let arg = args[i++];
       let s;
       switch (conv) {
-        case 'd': case 'i': s = String(Math.trunc(numVal(arg))); break;
+        case 'd': case 'i': s = typeof arg === 'bigint' ? String(arg) : String(Math.trunc(numVal(arg))); break;
         case 'f': s = numVal(arg).toFixed(prec === undefined ? 6 : +prec); break;
         case 'e': s = numVal(arg).toExponential(prec === undefined ? 6 : +prec).replace(/e([+-])(\d)$/, 'e$10$2'); break;
         case 'g': case 'G': {
@@ -616,12 +670,17 @@ function sprintf(fmt, args) {
           break;
         }
         case 's': s = toS(arg); if (prec !== undefined) s = s.slice(0, +prec); break;
-        case 'x': s = Math.trunc(numVal(arg)).toString(16); break;
-        case 'X': s = Math.trunc(numVal(arg)).toString(16).toUpperCase(); break;
-        case 'o': s = Math.trunc(numVal(arg)).toString(8); break;
-        case 'b': s = Math.trunc(numVal(arg)).toString(2); break;
+        case 'x': s = (typeof arg === 'bigint' ? arg : Math.trunc(numVal(arg))).toString(16); break;
+        case 'X': s = (typeof arg === 'bigint' ? arg : Math.trunc(numVal(arg))).toString(16).toUpperCase(); break;
+        case 'o': s = (typeof arg === 'bigint' ? arg : Math.trunc(numVal(arg))).toString(8); break;
+        case 'b': s = (typeof arg === 'bigint' ? arg : Math.trunc(numVal(arg))).toString(2); break;
         case 'c': s = typeof arg === 'number' ? String.fromCharCode(arg) : toS(arg); break;
         default: s = toS(arg);
+      }
+      // `#` flag: radix prefix for non-zero x/X/o/b.
+      if (flags.includes('#') && numVal(arg) !== 0) {
+        if (conv === 'x') s = '0x' + s; else if (conv === 'X') s = '0X' + s;
+        else if (conv === 'o') s = '0' + s; else if (conv === 'b') s = '0b' + s;
       }
       const neg = s.startsWith('-');
       if (flags.includes('+') && !neg && 'difeEgG'.includes(conv)) s = '+' + s;
@@ -782,14 +841,16 @@ function rbRaise(arg1, arg2) {
   if (arg1 instanceof RString) raiseError(RuntimeErrorC, arg1.value);
   if (arg1 instanceof RClass) {
     const obj = new RObject(arg1);
-    const msg = arg2 != null ? arg2 : new RString(arg1.name);
     const init = findMethod(arg1, 'initialize');
-    if (init) init(obj, [msg]);
-    else obj.ivars['@message'] = msg instanceof RString ? msg : new RString(toS(msg));
-    if (obj.ivars['@message'] == null) obj.ivars['@message'] = msg instanceof RString ? msg : new RString(toS(msg));
+    // With no explicit message, call initialize with no args so the exception's
+    // own default message (via its initialize / super) applies.
+    if (init) init(obj, arg2 != null ? [arg2] : []);
+    else if (arg2 != null) obj.ivars['@message'] = arg2 instanceof RString ? arg2 : new RString(toS(arg2));
+    if (obj.ivars['@message'] == null) obj.ivars['@message'] = new RString(arg1.name);
+    setCause(obj);
     throw new RubyError(obj);
   }
-  if (arg1 instanceof RObject) throw new RubyError(arg1);
+  if (arg1 instanceof RObject) { setCause(arg1); throw new RubyError(arg1); }
   raiseError(TypeErrorC, 'exception class/object expected');
 }
 
@@ -1097,6 +1158,7 @@ installRational();
 installComplex();
 installNumeric();
 installString();
+installEncoding();
 installSymbol();
 installArray();
 installHash();
@@ -1164,7 +1226,14 @@ function installKernel() {
     const v = args[0];
     if (isInt(v)) return v;
     if (v instanceof RFloat) return Math.trunc(v.value);
-    if (v instanceof RString) { const base = args[1] ? numVal(args[1]) : 10; const n = parseInt(v.value.trim(), base); if (Number.isNaN(n)) raiseError(ArgumentErrorC, `invalid value for Integer(): "${v.value}"`); return n; }
+    if (v instanceof RString) {
+      const base = args[1] ? numVal(args[1]) : 10;
+      const t = v.value.trim().replace(/_/g, '');
+      const re = base === 16 ? /^([-+]?)(?:0x)?([0-9a-fA-F]+)$/i : base === 2 ? /^([-+]?)(?:0b)?([01]+)$/i : base === 8 ? /^([-+]?)(?:0o)?([0-7]+)$/i : /^([-+]?)(\d+)$/;
+      const m = t.match(re);
+      if (!m) raiseError(ArgumentErrorC, `invalid value for Integer(): "${v.value}"`);
+      return parseDigits(m[1], m[2], base);
+    }
     raiseError(TypeErrorC, "can't convert to Integer");
   });
   def(ObjectC, 'Float', (self, args) => {
@@ -1308,17 +1377,35 @@ function dupValue(self) {
 // ---- Integer --------------------------------------------------------------
 function installInteger() {
   const I = IntegerC;
-  def(I, '+', (s, a) => (isInt(a[0]) ? s + a[0] : intCoerce(s, a[0], '+') ?? numericOp(s, a[0], (x, y) => x + y)));
-  def(I, '-', (s, a) => (isInt(a[0]) ? s - a[0] : intCoerce(s, a[0], '-') ?? numericOp(s, a[0], (x, y) => x - y)));
-  def(I, '*', (s, a) => (isInt(a[0]) ? s * a[0] : intCoerce(s, a[0], '*') ?? numericOp(s, a[0], (x, y) => x * y)));
+  def(I, '+', (s, a) => intArith(s, a[0], (x, y) => x + y, (x, y) => x + y, '+'));
+  def(I, '-', (s, a) => intArith(s, a[0], (x, y) => x - y, (x, y) => x - y, '-'));
+  def(I, '*', (s, a) => intArith(s, a[0], (x, y) => x * y, (x, y) => x * y, '*'));
   def(I, '/', (s, a) => {
-    if (isInt(a[0])) { if (a[0] === 0) raiseError(ZeroDivisionErrorC, 'divided by 0'); return Math.floor(s / a[0]); }
-    { const c = intCoerce(s, a[0], '/'); if (c !== undefined) return c; }
-    return mkfloat(s / numVal(a[0]));
+    const b = a[0];
+    if (b instanceof RFloat) return mkfloat(numVal(s) / b.value);
+    if (!isInt(b)) { const c = intCoerce(s, b, '/'); if (c !== undefined) return c; return mkfloat(numVal(s) / numVal(b)); }
+    if (typeof s === 'number' && typeof b === 'number') { if (b === 0) raiseError(ZeroDivisionErrorC, 'divided by 0'); return Math.floor(s / b); }
+    const bb = asBig(b); if (bb === 0n) raiseError(ZeroDivisionErrorC, 'divided by 0');
+    return fixnum(bigFloorDiv(asBig(s), bb));
   });
-  def(I, '%', (s, a) => (isInt(a[0]) ? ((s % a[0]) + a[0]) % a[0] : mkfloat(jsmod(s, numVal(a[0])))));
+  def(I, '%', (s, a) => {
+    const b = a[0];
+    if (b instanceof RFloat) return mkfloat(jsmod(numVal(s), b.value));
+    if (!isInt(b)) return numericOp(s, b, (x, y) => jsmod(x, y));
+    if (typeof s === 'number' && typeof b === 'number') { if (b === 0) raiseError(ZeroDivisionErrorC, 'divided by 0'); return ((s % b) + b) % b; }
+    const bb = asBig(b); if (bb === 0n) raiseError(ZeroDivisionErrorC, 'divided by 0');
+    return fixnum(((asBig(s) % bb) + bb) % bb);
+  });
   def(I, 'modulo', I.methods.get('%'));
-  def(I, '**', (s, a) => (isInt(a[0]) && a[0] >= 0 ? Math.pow(s, a[0]) : mkfloat(Math.pow(s, numVal(a[0])))));
+  def(I, '**', (s, a) => {
+    const b = a[0];
+    if (isInt(b)) {
+      const e = numVal(b);
+      if (e >= 0) { if (typeof s === 'number' && typeof b === 'number') { const r = Math.pow(s, e); if (Number.isSafeInteger(r)) return r; } return fixnum(asBig(s) ** asBig(b)); }
+      const p = send(s, '**', [-e]); return isInt(p) ? mkRational(1, numVal(p)) : mkfloat(Math.pow(numVal(s), e));
+    }
+    return mkfloat(Math.pow(numVal(s), numVal(b)));
+  });
   def(I, 'pow', (s, a) => {
     if (a[1] != null) { // modular exponentiation: pow(exp, mod)
       const m = BigInt(numVal(a[1])); if (m === 0n) raiseError(ZeroDivisionErrorC, 'divided by 0');
@@ -1328,39 +1415,39 @@ function installInteger() {
     }
     return send(s, '**', [a[0]]);
   });
-  def(I, '-@', (s) => -s);
+  def(I, '-@', (s) => (typeof s === 'bigint' ? fixnum(-s) : -s));
   def(I, '+@', (s) => s);
-  def(I, '<=>', (s, a) => { const b = a[0]; if (b instanceof RRational) return send(mkRational(s, 1), '<=>', [b]); return isNum(b) ? cmpNum(s, b) : null; });
-  def(I, '==', (s, a) => { const b = a[0]; if (b instanceof RRational || b instanceof RComplex) return truthy(send(b, '==', [s])); return isNum(b) && s === numVal(b); });
-  def(I, '<', (s, a) => s < numVal(a[0]));
-  def(I, '>', (s, a) => s > numVal(a[0]));
-  def(I, '<=', (s, a) => s <= numVal(a[0]));
-  def(I, '>=', (s, a) => s >= numVal(a[0]));
-  def(I, '&', (s, a) => s & a[0]);
-  def(I, '|', (s, a) => s | a[0]);
-  def(I, '^', (s, a) => s ^ a[0]);
-  def(I, '~', (s) => ~s);
-  def(I, '[]', (s, a) => { const i = numVal(a[0]); if (i < 0) return 0; return Number((BigInt(s) >> BigInt(i)) & 1n); });
-  def(I, '<<', (s, a) => s * Math.pow(2, a[0]));
-  def(I, '>>', (s, a) => Math.floor(s / Math.pow(2, a[0])));
+  def(I, '<=>', (s, a) => { const b = a[0]; if (b instanceof RRational) return send(mkRational(s, 1), '<=>', [b]); return isNum(b) ? intCmp(s, b) : null; });
+  def(I, '==', (s, a) => { const b = a[0]; if (b instanceof RRational || b instanceof RComplex) return truthy(send(b, '==', [s])); if (!isNum(b)) return false; if (typeof s === 'bigint' || typeof b === 'bigint') return isInt(b) ? asBig(s) === asBig(b) : numVal(s) === numVal(b); return s === numVal(b); });
+  def(I, '<', (s, a) => intCmp(s, a[0]) < 0);
+  def(I, '>', (s, a) => intCmp(s, a[0]) > 0);
+  def(I, '<=', (s, a) => intCmp(s, a[0]) <= 0);
+  def(I, '>=', (s, a) => intCmp(s, a[0]) >= 0);
+  def(I, '&', (s, a) => fixnum(asBig(s) & asBig(a[0])));
+  def(I, '|', (s, a) => fixnum(asBig(s) | asBig(a[0])));
+  def(I, '^', (s, a) => fixnum(asBig(s) ^ asBig(a[0])));
+  def(I, '~', (s) => fixnum(~asBig(s)));
+  def(I, '[]', (s, a) => { const i = numVal(a[0]); if (i < 0) return 0; return Number((asBig(s) >> BigInt(i)) & 1n); });
+  def(I, '<<', (s, a) => fixnum(asBig(s) << asBig(a[0])));
+  def(I, '>>', (s, a) => fixnum(asBig(s) >> asBig(a[0])));
   def(I, 'times', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (let i = 0; i < s; i++) yield i; }); try { for (let i = 0; i < s; i++) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
   def(I, 'upto', (s, a, blk) => { const to = numVal(a[0]); if (!blk) return mkEnum(function* () { for (let i = s; i <= to; i++) yield i; }); try { for (let i = s; i <= to; i++) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
   def(I, 'downto', (s, a, blk) => { const to = numVal(a[0]); if (!blk) return mkEnum(function* () { for (let i = s; i >= to; i--) yield i; }); try { for (let i = s; i >= to; i--) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
   def(I, 'step', (s, a, blk) => { const to = numVal(a[0]); const by = a[1] != null ? numVal(a[1]) : 1; if (!blk) return mkEnum(function* () { if (by > 0) { for (let i = s; i <= to; i += by) yield i; } else { for (let i = s; i >= to; i += by) yield i; } }); try { if (by > 0) for (let i = s; i <= to; i += by) safeYield(blk, [i]); else for (let i = s; i >= to; i += by) safeYield(blk, [i]); } catch (e) { return brk(e); } return s; });
-  def(I, 'abs', (s) => Math.abs(s));
-  def(I, 'magnitude', (s) => Math.abs(s));
-  def(I, 'even?', (s) => s % 2 === 0);
-  def(I, 'odd?', (s) => Math.abs(s % 2) === 1);
-  def(I, 'zero?', (s) => s === 0);
-  def(I, 'nonzero?', (s) => (s === 0 ? null : s));
-  def(I, 'positive?', (s) => s > 0);
-  def(I, 'negative?', (s) => s < 0);
-  def(I, 'succ', (s) => s + 1);
-  def(I, 'next', (s) => s + 1);
-  def(I, 'pred', (s) => s - 1);
+  def(I, 'abs', (s) => (typeof s === 'bigint' ? (s < 0n ? fixnum(-s) : s) : Math.abs(s)));
+  def(I, 'magnitude', I.methods.get('abs'));
+  def(I, 'even?', (s) => (typeof s === 'bigint' ? s % 2n === 0n : s % 2 === 0));
+  def(I, 'odd?', (s) => (typeof s === 'bigint' ? (s % 2n !== 0n) : Math.abs(s % 2) === 1));
+  def(I, 'zero?', (s) => s === 0 || s === 0n);
+  def(I, 'nonzero?', (s) => (s === 0 || s === 0n ? null : s));
+  def(I, 'positive?', (s) => (typeof s === 'bigint' ? s > 0n : s > 0));
+  def(I, 'negative?', (s) => (typeof s === 'bigint' ? s < 0n : s < 0));
+  def(I, 'succ', (s) => (typeof s === 'bigint' ? fixnum(s + 1n) : s + 1));
+  def(I, 'next', I.methods.get('succ'));
+  def(I, 'pred', (s) => (typeof s === 'bigint' ? fixnum(s - 1n) : s - 1));
   def(I, 'to_i', (s) => s);
   def(I, 'to_int', (s) => s);
-  def(I, 'to_f', (s) => mkfloat(s));
+  def(I, 'to_f', (s) => mkfloat(numVal(s)));
   def(I, 'to_s', (s, a) => new RString(a && a[0] != null ? s.toString(numVal(a[0])) : String(s)));
   def(I, 'inspect', (s) => new RString(String(s)));
   def(I, 'to_r', (s) => new RRational(s, 1));
@@ -1368,21 +1455,21 @@ function installInteger() {
   def(I, 'numerator', (s) => s);
   def(I, 'denominator', () => 1);
   def(I, 'to_c', (s) => mkComplex(s, 0));
-  def(I, 'chr', (s) => new RString(String.fromCharCode(s)));
+  def(I, 'chr', (s) => { const n = Number(s); const r = new RString(String.fromCharCode(n)); if (n >= 128 && n <= 255) r.enc = 'ASCII-8BIT'; else if (n < 128) r.enc = 'US-ASCII'; return r; });
   def(I, 'ord', (s) => s);
   def(I, 'floor', (s, a) => roundInt(s, a, 'floor'));
   def(I, 'ceil', (s, a) => roundInt(s, a, 'ceil'));
   def(I, 'round', (s, a) => roundInt(s, a, 'round'));
-  def(I, 'truncate', (s) => s);
-  def(I, 'gcd', (s, a) => gcd(Math.abs(s), Math.abs(numVal(a[0]))));
-  def(I, 'lcm', (s, a) => { const b = Math.abs(numVal(a[0])); return s === 0 || b === 0 ? 0 : Math.abs(s * b) / gcd(Math.abs(s), b); });
-  def(I, 'divmod', (s, a) => { const b = numVal(a[0]); return [Math.floor(s / b), ((s % b) + b) % b]; });
-  def(I, 'fdiv', (s, a) => mkfloat(s / numVal(a[0])));
-  def(I, 'div', (s, a) => Math.floor(s / numVal(a[0])));
-  def(I, 'remainder', (s, a) => s % numVal(a[0]));
-  def(I, 'digits', (s, a) => { const base = a && a[0] != null ? numVal(a[0]) : 10; let n = Math.abs(s); const out = []; if (n === 0) return [0]; while (n > 0) { out.push(n % base); n = Math.floor(n / base); } return out; });
-  def(I, 'bit_length', (s) => (s === 0 ? 0 : Math.floor(Math.log2(Math.abs(s))) + 1));
-  def(I, 'coerce', (s, a) => [mkfloat(numVal(a[0])), mkfloat(s)]);
+  def(I, 'truncate', (s, a) => roundInt(s, a, 'trunc'));
+  def(I, 'gcd', (s, a) => { const b = a[0]; if (typeof s === 'bigint' || typeof b === 'bigint') return fixnum(gcdBig(asBig(s), asBig(b))); return gcd(Math.abs(s), Math.abs(numVal(b))); });
+  def(I, 'lcm', (s, a) => { const b = a[0]; if (typeof s === 'bigint' || typeof b === 'bigint') { const x = asBig(s) < 0n ? -asBig(s) : asBig(s), y = asBig(b) < 0n ? -asBig(b) : asBig(b); return (x === 0n || y === 0n) ? 0 : fixnum(x / gcdBig(x, y) * y); } const bb = Math.abs(numVal(b)); return s === 0 || bb === 0 ? 0 : Math.abs(s * bb) / gcd(Math.abs(s), bb); });
+  def(I, 'divmod', (s, a) => [send(s, '/', [a[0]]), send(s, '%', [a[0]])]);
+  def(I, 'fdiv', (s, a) => mkfloat(numVal(s) / numVal(a[0])));
+  def(I, 'div', (s, a) => (isInt(a[0]) ? send(s, '/', [a[0]]) : Math.floor(numVal(s) / numVal(a[0]))));
+  def(I, 'remainder', (s, a) => { const b = a[0]; if (isInt(b) && (typeof s === 'bigint' || typeof b === 'bigint')) return fixnum(asBig(s) % asBig(b)); return numVal(s) % numVal(b); });
+  def(I, 'digits', (s, a) => { const base = a && a[0] != null ? asBig(numVal(a[0])) : 10n; let n = asBig(s); if (n < 0n) raiseError(defConst('Math::DomainError', StandardErrorC), 'out of domain'); const out = []; if (n === 0n) return [0]; while (n > 0n) { out.push(Number(n % base)); n = n / base; } return out; });
+  def(I, 'bit_length', (s) => { let n = asBig(s); if (n < 0n) n = -n - 1n; let c = 0; while (n > 0n) { n >>= 1n; c++; } return c; });
+  def(I, 'coerce', (s, a) => (isInt(a[0]) ? [a[0], s] : [mkfloat(numVal(a[0])), mkfloat(numVal(s))]));
   def(I, 'integer?', () => true);
   def(I, 'between?', (s, a) => s >= numVal(a[0]) && s <= numVal(a[1]));
   def(I, 'clamp', (s, a) => { if (a[0] instanceof RRange) { const lo = a[0].from, hi = a[0].to; return s < lo ? lo : s > hi ? hi : s; } const lo = numVal(a[0]), hi = numVal(a[1]); return s < lo ? lo : s > hi ? hi : s; });
@@ -1412,6 +1499,7 @@ function roundInt(s, a, mode) {
   const f = Math.pow(10, -d);
   if (mode === 'floor') return Math.floor(s / f) * f;
   if (mode === 'ceil') return Math.ceil(s / f) * f;
+  if (mode === 'trunc') return Math.trunc(s / f) * f;
   return Math.round(s / f) * f;
 }
 function safeYield(blk, args) {
@@ -1451,7 +1539,7 @@ function installFloat() {
   def(F, 'floor', (s, a) => floatRound(s.value, a, Math.floor));
   def(F, 'ceil', (s, a) => floatRound(s.value, a, Math.ceil));
   def(F, 'round', (s, a) => floatRound(s.value, a, Math.round));
-  def(F, 'truncate', (s) => Math.trunc(s.value));
+  def(F, 'truncate', (s, a) => { const d = a && a[0] != null ? numVal(a[0]) : 0; if (d <= 0) { const f = Math.pow(10, -d); return Math.trunc(s.value / f) * f; } const f = Math.pow(10, d); return mkfloat(Math.trunc(s.value * f) / f); });
   def(F, 'nan?', (s) => Number.isNaN(s.value));
   def(F, 'infinite?', (s) => (s.value === Infinity ? 1 : s.value === -Infinity ? -1 : null));
   def(F, 'finite?', (s) => Number.isFinite(s.value));
@@ -1469,7 +1557,8 @@ function installFloat() {
 }
 function floatRound(v, a, fn) {
   const d = a && a[0] != null ? numVal(a[0]) : 0;
-  if (d === 0) return fn(v);
+  // Non-positive precision yields an Integer; positive precision keeps a Float.
+  if (d <= 0) { const f = Math.pow(10, -d); return fn(v / f) * f; }
   const f = Math.pow(10, d);
   return mkfloat(fn(v * f) / f);
 }
@@ -1604,6 +1693,24 @@ function checkFrozen(obj) {
 }
 
 // ---- String ---------------------------------------------------------------
+// A string's bytes: latin1 char codes for binary strings, UTF-8 bytes otherwise.
+function strBytes(s) { if (s.enc === 'ASCII-8BIT') { const b = []; for (let i = 0; i < s.value.length; i++) b.push(s.value.charCodeAt(i) & 0xff); return b; } return [...Buffer.from(s.value, 'utf8')]; }
+function normEncName(n) { const u = String(n).toUpperCase(); if (u === 'BINARY' || u === 'ASCII-8BIT') return 'ASCII-8BIT'; if (u === 'UTF8' || u === 'UTF-8') return 'UTF-8'; if (u === 'US-ASCII' || u === 'ASCII') return 'US-ASCII'; return n; }
+function encodingObj(name) { const k = normEncName(name); let o = ENCODING_CACHE.get(k); if (!o) { o = new RObject(EncodingC); o.ivars['@name'] = new RString(k); ENCODING_CACHE.set(k, o); } return o; }
+function installEncoding() {
+  const E = EncodingC;
+  def(E, 'name', (s) => s.ivars['@name']);
+  def(E, 'to_s', (s) => s.ivars['@name']);
+  def(E, 'inspect', (s) => { const nm = jsstr(s.ivars['@name']); return new RString(nm === 'ASCII-8BIT' ? '#<Encoding:BINARY (ASCII-8BIT)>' : `#<Encoding:${nm}>`); });
+  def(E, '==', (s, a) => a[0] === s);
+  sdef(E, 'default_external', () => encodingObj('UTF-8'));
+  sdef(E, 'default_internal', () => null);
+  E.constants.set('UTF_8', encodingObj('UTF-8'));
+  E.constants.set('ASCII_8BIT', encodingObj('ASCII-8BIT'));
+  E.constants.set('BINARY', encodingObj('ASCII-8BIT'));
+  E.constants.set('US_ASCII', encodingObj('US-ASCII'));
+  E.constants.set('ASCII', encodingObj('US-ASCII'));
+}
 function installString() {
   const S = StringC;
   const v = (s) => s.value;
@@ -1633,7 +1740,7 @@ function installString() {
   def(S, '>=', (s, a) => s.value >= a[0].value);
   def(S, 'length', (s) => [...s.value].length);
   def(S, 'size', S.methods.get('length'));
-  def(S, 'bytesize', (s) => Buffer.byteLength(s.value, 'utf8'));
+  def(S, 'bytesize', (s) => (s.enc === 'ASCII-8BIT' ? s.value.length : Buffer.byteLength(s.value, 'utf8')));
   def(S, 'upcase', (s) => new RString(s.value.toUpperCase()));
   def(S, 'downcase', (s) => new RString(s.value.toLowerCase()));
   def(S, 'upcase!', (s) => { checkFrozen(s); const o = s.value; s.value = s.value.toUpperCase(); return o === s.value ? null : s; });
@@ -1653,13 +1760,13 @@ function installString() {
   def(S, 'chomp!', (s, a) => { checkFrozen(s); const o = s.value; s.value = jsstr(send(s, 'chomp', a)); return o === s.value ? null : s; });
   def(S, 'chop', (s) => new RString(s.value.replace(/(\r\n|.)$/, '')));
   def(S, 'chars', (s) => [...s.value].map((c) => new RString(c)));
-  def(S, 'bytes', (s) => [...Buffer.from(s.value, 'utf8')]);
+  def(S, 'bytes', (s) => strBytes(s));
   def(S, 'lines', (s) => { const parts = s.value.split(/(?<=\n)/); return parts.filter((p) => p.length).map((p) => new RString(p)); });
   def(S, 'each_char', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (const c of s.value) yield new RString(c); }); try { for (const c of s.value) safeYield(blk, [new RString(c)]); } catch (e) { return brk(e); } return s; });
   def(S, 'each_line', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (const l of s.value.split(/(?<=\n)/)) if (l.length) yield new RString(l); }); try { for (const l of s.value.split(/(?<=\n)/)) if (l.length) safeYield(blk, [new RString(l)]); } catch (e) { return brk(e); } return s; });
   def(S, 'grapheme_clusters', (s) => graphemes(s.value).map((g) => new RString(g)));
   def(S, 'each_grapheme_cluster', (s, a, blk) => { const gs = graphemes(s.value); if (!blk) return mkEnum(function* () { for (const g of gs) yield new RString(g); }); try { for (const g of gs) safeYield(blk, [new RString(g)]); } catch (e) { return brk(e); } return s; });
-  def(S, 'each_byte', (s, a, blk) => { if (!blk) return mkEnum(function* () { for (const b of Buffer.from(s.value, 'utf8')) yield b; }); try { for (const b of Buffer.from(s.value, 'utf8')) safeYield(blk, [b]); } catch (e) { return brk(e); } return s; });
+  def(S, 'each_byte', (s, a, blk) => { const bytes = strBytes(s); if (!blk) return mkEnum(function* () { for (const b of bytes) yield b; }); try { for (const b of bytes) safeYield(blk, [b]); } catch (e) { return brk(e); } return s; });
   def(S, 'split', (s, a) => strSplit(s.value, a));
   def(S, 'include?', (s, a) => s.value.includes(jsstr(a[0])));
   def(S, 'start_with?', (s, a) => a.some((x) => s.value.startsWith(jsstr(x))));
@@ -1680,11 +1787,15 @@ function installString() {
   });
   def(S, 'rindex', (s, a) => { const needle = jsstr(a[0]); const bi = s.value.lastIndexOf(needle); return bi < 0 ? null : [...s.value.slice(0, bi)].length; });
   def(S, 'replace', (s, a) => { checkFrozen(s); s.value = jsstr(a[0]); return s; });
+  def(S, 'insert', (s, a) => { checkFrozen(s); const chars = [...s.value]; let i = numVal(a[0]); if (i < 0) i = chars.length + i + 1; chars.splice(i, 0, jsstr(a[1])); s.value = chars.join(''); return s; });
+  def(S, 'casecmp', (s, a) => { const x = s.value.toLowerCase(), y = jsstr(a[0]).toLowerCase(); return x < y ? -1 : x > y ? 1 : 0; });
+  def(S, 'casecmp?', (s, a) => s.value.toLowerCase() === jsstr(a[0]).toLowerCase());
   def(S, 'sub', (s, a, blk) => new RString(strSub(s.value, a, blk, false)));
   def(S, 'gsub', (s, a, blk) => new RString(strSub(s.value, a, blk, true)));
   def(S, 'sub!', (s, a, blk) => { checkFrozen(s); const o = s.value; s.value = strSub(s.value, a, blk, false); return o === s.value ? null : s; });
   def(S, 'gsub!', (s, a, blk) => { checkFrozen(s); const o = s.value; s.value = strSub(s.value, a, blk, true); return o === s.value ? null : s; });
   def(S, 'tr', (s, a) => new RString(strTr(s.value, jsstr(a[0]), jsstr(a[1]))));
+  def(S, 'tr_s', (s, a) => new RString(strTr(s.value, jsstr(a[0]), jsstr(a[1]), true)));
   def(S, 'tr!', (s, a) => { checkFrozen(s); const o = s.value; s.value = strTr(s.value, jsstr(a[0]), jsstr(a[1])); return o === s.value ? null : s; });
   def(S, 'delete', (s, a) => new RString(strTr(s.value, jsstr(a[0]), '')));
   def(S, 'delete!', (s, a) => { checkFrozen(s); const o = s.value; s.value = strTr(s.value, jsstr(a[0]), ''); return o === s.value ? null : s; });
@@ -1697,13 +1808,13 @@ function installString() {
     return new RString(out);
   });
   def(S, 'squeeze!', (s) => { checkFrozen(s); const o = s.value; s.value = s.value.replace(/(.)\1+/g, '$1'); return o === s.value ? null : s; });
-  def(S, 'to_i', (s, a) => { const base = a && a[0] != null ? numVal(a[0]) : 10; const re = base === 16 ? /^[-+]?[0-9a-fA-F]+/ : base === 2 ? /^[-+]?[01]+/ : base === 8 ? /^[-+]?[0-7]+/ : /^[-+]?\d+/; const m = s.value.trim().match(re); const n = m ? parseInt(m[0], base) : 0; return Number.isNaN(n) ? 0 : n; });
+  def(S, 'to_i', (s, a) => { const base = a && a[0] != null ? numVal(a[0]) : 10; const re = base === 16 ? /^([-+]?)([0-9a-fA-F]+)/ : base === 2 ? /^([-+]?)([01]+)/ : base === 8 ? /^([-+]?)([0-7]+)/ : /^([-+]?)(\d+)/; const m = s.value.trim().replace(/_/g, '').match(re); return m ? parseDigits(m[1], m[2], base) : 0; });
   def(S, 'to_f', (s) => { const m = s.value.trim().match(/^[-+]?\d*\.?\d+([eE][-+]?\d+)?/); return mkfloat(m ? parseFloat(m[0]) : 0); });
   def(S, 'to_s', (s) => s);
   def(S, 'to_str', (s) => s);
   def(S, 'to_sym', (s) => R.sym(s.value));
   def(S, 'intern', (s) => R.sym(s.value));
-  def(S, 'inspect', (s) => new RString(strInspect(s.value)));
+  def(S, 'inspect', (s) => new RString(strInspect(s.value, s.enc === 'ASCII-8BIT')));
   def(S, 'empty?', (s) => s.value.length === 0);
   def(S, 'hash', (s) => { let h = 0; for (let i = 0; i < s.value.length; i++) h = (h * 31 + s.value.charCodeAt(i)) | 0; return h; });
   def(S, '[]', (s, a) => strSlice(s, a));
@@ -1725,17 +1836,22 @@ function installString() {
   def(S, 'scan', (s, a, blk) => { const re = jsRe(a[0], true); const out = []; let m; while ((m = re.exec(s.value))) { const item = m.length > 1 ? m.slice(1).map((x) => (x != null ? new RString(x) : null)) : new RString(m[0]); if (blk) callBlock(blk, [item]); else out.push(item); if (m.index === re.lastIndex) re.lastIndex++; } return blk ? s : out; });
   def(S, '=~', (s, a) => { if (!(a[0] instanceof RRegexp)) return null; const m = s.value.match(jsRe(a[0])); gvars['$~'] = m ? mkMatchData(m, s.value) : null; return m ? m.index : null; });
   def(S, 'each_with_index', (s, a, blk) => { let i = 0; for (const c of s.value) safeYield(blk, [new RString(c), i++]); return s; });
-  def(S, 'encoding', (s) => new RString('UTF-8'));
-  def(S, 'force_encoding', (s) => s);
+  def(S, 'encoding', (s) => encodingObj(s.enc || 'UTF-8'));
+  def(S, 'force_encoding', (s, a) => {
+    const n = normEncName(a[0] instanceof RObject ? jsstr(send(a[0], 'name', [])) : jsstr(a[0]));
+    // Re-decode binary bytes as UTF-8 text so char ops reflect the new encoding.
+    if (s.enc === 'ASCII-8BIT' && n === 'UTF-8') { const bytes = strBytes(s); s.value = Buffer.from(bytes).toString('utf8'); }
+    s.enc = n;
+    return s;
+  });
   def(S, 'valid_encoding?', () => true);
   def(S, 'ascii_only?', (s) => /^[\x00-\x7f]*$/.test(s.value));
   def(S, 'encode', (s) => new RString(s.value));
-  def(S, 'b', (s) => new RString(s.value));
+  def(S, 'b', (s) => { const r = new RString(s.value); r.enc = 'ASCII-8BIT'; return r; });
   def(S, 'scrub', (s, a) => new RString(s.value));
   def(S, 'unicode_normalize', (s) => new RString(s.value.normalize()));
-  def(S, 'unpack', (s, a) => rbUnpack(s.value, jsstr(a[0])));
-  def(S, 'unpack1', (s, a) => { const r = rbUnpack(s.value, jsstr(a[0])); return r.length ? r[0] : null; });
-  def(S, 'b', (s) => s);
+  def(S, 'unpack', (s, a) => rbUnpack(s, jsstr(a[0])));
+  def(S, 'unpack1', (s, a) => { const r = rbUnpack(s, jsstr(a[0])); return r.length ? r[0] : null; });
 }
 
 function padStr(pad, len) { let out = ''; while (out.length < len) out += pad; return out.slice(0, len); }
@@ -1800,19 +1916,23 @@ function rubyReplToJs(rep) {
 }
 function graphemes(str) { return [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(str)].map((seg) => seg.segment); }
 function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-function strTr(str, from, to) {
+function strTr(str, from, to, squeeze) {
   // A leading `^` negates the from-set (matches every char NOT listed).
   const negated = from.length > 1 && from[0] === '^';
   const fset = expandTr(negated ? from.slice(1) : from);
   const tset = expandTr(to);
-  let out = '';
+  let out = ''; let lastTranslated = null;
   for (const c of str) {
     const inSet = fset.indexOf(c) >= 0;
     const match = negated ? !inSet : inSet;
     if (match) {
       // negated: all matched chars map to the last replacement char
-      if (tset.length) out += negated ? tset[tset.length - 1] : tset[Math.min(fset.indexOf(c), tset.length - 1)];
-    } else out += c;
+      if (tset.length) {
+        const rep = negated ? tset[tset.length - 1] : tset[Math.min(fset.indexOf(c), tset.length - 1)];
+        if (squeeze && rep === lastTranslated) continue;
+        out += rep; lastTranslated = rep;
+      }
+    } else { out += c; lastTranslated = null; }
   }
   return out;
 }
@@ -1859,7 +1979,7 @@ function installSymbol() {
   def(Y, 'id2name', (s) => new RString(s.name));
   def(Y, 'name', (s) => new RString(s.name));
   def(Y, 'to_sym', (s) => s);
-  def(Y, 'to_proc', (s) => makeProc((args) => send(args[0], s.name, args.slice(1))));
+  def(Y, 'to_proc', (s) => makeProc((args) => send(args[0], s.name, args.slice(1)), false, -2));
   def(Y, 'inspect', (s) => new RString(inspect(s)));
   def(Y, '==', (s, a) => a[0] instanceof RSymbol && s.name === a[0].name);
   def(Y, '<=>', (s, a) => (a[0] instanceof RSymbol ? (s.name < a[0].name ? -1 : s.name > a[0].name ? 1 : 0) : null));
@@ -1944,6 +2064,7 @@ function installArray() {
   def(A, 'min_by', (s, a, blk) => minMaxBy(s, blk, -1));
   def(A, 'max_by', (s, a, blk) => minMaxBy(s, blk, 1));
   def(A, 'minmax', (s) => [send(s, 'min', []), send(s, 'max', [])]);
+  def(A, 'minmax_by', (s, a, blk) => [minMaxBy(s, blk, -1), minMaxBy(s, blk, 1)]);
   def(A, 'sum', (s, a, blk) => { let acc = a[0] != null ? a[0] : 0; for (const x of s) acc = send(acc, '+', [blk ? callBlock(blk, [x]) : x]); return acc; });
   def(A, 'reduce', (s, a, blk) => arrReduce(s, a, blk));
   def(A, 'inject', A.methods.get('reduce'));
@@ -1952,7 +2073,7 @@ function installArray() {
   def(A, 'sort_by', (s, a, blk) => s.map((x) => [callBlock(blk, [x]), x]).sort((p, q) => spaceship(p[0], q[0])).map((p) => p[1]));
   def(A, 'sort_by!', (s, a, blk) => { const r = send(s, 'sort_by', a, blk); s.length = 0; s.push(...r); return s; });
   def(A, 'group_by', (s, a, blk) => { const h = new RHash(); for (const x of s) { const k = callBlock(blk, [x]); if (!h.has(k)) h.set(k, []); h.get(k).push(x); } return h; });
-  def(A, 'partition', (s, a, blk) => { const t = [], f = []; for (const x of s) (truthy(callBlock(blk, [x])) ? t : f).push(x); return [t, f]; });
+  def(A, 'partition', (s, a, blk) => { if (!blk) return methodEnum(s, 'partition', []); const t = [], f = []; for (const x of s) (truthy(callBlock(blk, [x])) ? t : f).push(x); return [t, f]; });
   def(A, 'chunk_while', (s, a, blk) => { if (!s.length) return []; const out = [[s[0]]]; for (let i = 1; i < s.length; i++) { if (truthy(callBlock(blk, [s[i - 1], s[i]]))) out[out.length - 1].push(s[i]); else out.push([s[i]]); } return out; });
   def(A, 'chunk', (s, a, blk) => { if (!blk) return mkEnum(function* () { yield* chunkArr(s, blk); }); return chunkArr(s, blk); });
   def(A, 'each_entry', (s, a, blk) => { if (!blk) return mkEnum(function* () { yield* s; }); try { for (const x of s) safeYield(blk, [x]); } catch (e) { return brk(e); } return s; });
@@ -2074,12 +2195,13 @@ function rbPack(arr, fmt) {
       }
     }
   }
-  return new RString(bytes.map((b) => String.fromCharCode(b)).join(''));
+  const r = new RString(bytes.map((b) => String.fromCharCode(b)).join('')); r.enc = 'ASCII-8BIT'; return r;
 }
 function readInt(bytes, off, size, little, signed) { let v = 0n; for (let i = 0; i < size; i++) { const b = BigInt(bytes[off + (little ? i : size - 1 - i)] || 0); v |= b << BigInt(i * 8); } if (signed && (v & (1n << BigInt(size * 8 - 1)))) v -= 1n << BigInt(size * 8); return Number(v); }
-function rbUnpack(str, fmt) {
-  // latin1 byte view: each JS char contributes one byte (consistent with rbPack).
-  const bytes = []; for (let i = 0; i < str.length; i++) bytes.push(str.charCodeAt(i) & 0xff);
+function rbUnpack(strObj, fmt) {
+  // Byte view depends on encoding: latin1 for binary, UTF-8 otherwise.
+  const str = strObj.value;
+  const bytes = strBytes(strObj);
   const out = []; let pos = 0;
   for (const [d, cnt] of packTemplate(fmt)) {
     if ('aAZ'.includes(d)) { const n = cnt === '*' ? bytes.length - pos : cnt; const slice = bytes.slice(pos, pos + n); pos += n; let sv = slice.map((b) => String.fromCharCode(b)).join(''); if (d === 'A') sv = sv.replace(/[ \0]+$/, ''); else if (d === 'Z') { const z = sv.indexOf('\0'); if (z >= 0) sv = sv.slice(0, z); } out.push(new RString(sv)); continue; }
@@ -2171,8 +2293,8 @@ function installHash() {
   def(H, 'to_h', (s, a, blk) => { if (!blk) return s; const h = new RHash(); for (const [k, v] of s.entries()) { const pair = callBlock(blk, [k, v]); h.set(pair[0], pair[1]); } return h; });
   def(H, 'invert', (s) => { const h = new RHash(); for (const [k, v] of s.entries()) h.set(v, k); return h; });
   def(H, 'key', (s, a) => { for (const [k, v] of s.entries()) if (rbEqual(v, a[0])) return k; return null; });
-  def(H, 'transform_values', (s, a, blk) => { const h = new RHash(); for (const [k, v] of s.entries()) h.set(k, callBlock(blk, [v])); return h; });
-  def(H, 'transform_keys', (s, a, blk) => { const h = new RHash(); for (const [k, v] of s.entries()) h.set(blk ? callBlock(blk, [k]) : k, v); return h; });
+  def(H, 'transform_values', (s, a, blk) => { if (!blk) return methodEnum(s, 'transform_values', []); const h = new RHash(); for (const [k, v] of s.entries()) h.set(k, callBlock(blk, [v])); return h; });
+  def(H, 'transform_keys', (s, a, blk) => { if (!blk && !(a[0] instanceof RHash)) return methodEnum(s, 'transform_keys', []); const map = a[0] instanceof RHash ? a[0] : null; const h = new RHash(); for (const [k, v] of s.entries()) { let nk = k; if (map && map.has(k)) nk = map.get(k); else if (blk) nk = callBlock(blk, [k]); h.set(nk, v); } return h; });
   def(H, 'transform_values!', (s, a, blk) => { for (const [k, v] of [...s.entries()]) s.set(k, callBlock(blk, [v])); return s; });
   def(H, 'slice', (s, a) => { const h = new RHash(); for (const k of a) if (s.has(k)) h.set(k, s.get(k)); return h; });
   def(H, 'except', (s, a) => { const h = new RHash(); for (const [k, v] of s.entries()) if (!a.some((x) => rbEqual(x, k))) h.set(k, v); return h; });
@@ -2340,8 +2462,15 @@ function installProc() {
   def(P, '===', (s, a) => truthy(callProc(s, [a[0]])));
   def(P, 'to_proc', (s) => s);
   def(P, 'lambda?', (s) => s.isLambda);
-  def(P, 'arity', (s) => (s.arity != null ? s.arity : -1));
-  def(P, 'curry', (s) => s);
+  def(P, 'arity', (s) => procArityOf(s));
+  def(P, 'curry', (s, a) => {
+    const ar = a[0] != null ? numVal(a[0]) : Math.abs(procArityOf(s));
+    const build = (collected) => makeProc((args) => {
+      const all = collected.concat(args);
+      return all.length >= ar ? callProc(s, all) : build(all);
+    }, true, ar - collected.length);
+    return build([]);
+  });
   def(P, 'inspect', (s) => new RString('#<Proc' + (s.isLambda ? ' (lambda)' : '') + '>'));
   def(P, 'to_s', P.methods.get('inspect'));
   sdef(P, 'new', (cls, a, blk) => blk);
@@ -2416,6 +2545,15 @@ function installEnumerable() {
 
 // ---- Enumerator -----------------------------------------------------------
 function mkLazy(genFn) { const e = new REnumerator(genFn); e._lazy = true; return e; }
+// An Enumerator for a block-taking method called without a block: iterating it
+// yields what the block would receive, and `.with_index`/`.each` re-invoke the
+// original method with a supplied block (so e.g. `h.transform_values.with_index`
+// rebuilds the hash).
+function methodEnum(recv, name, args) {
+  const e = mkEnum(function* () { const out = []; send(recv, name, args, makeProc((a) => { out.push(a.length === 1 ? a[0] : a); })); yield* out; });
+  e._reinvoke = (blk) => send(recv, name, args, blk);
+  return e;
+}
 // Enumerator::Lazy: chainable transformations evaluated on demand, so they work
 // on infinite sequences. Each non-terminal op returns a new lazy enumerator.
 function installLazy() {
@@ -2457,15 +2595,16 @@ function installEnumerator() {
   def(E, 'to_a', (s) => [...s]);
   def(E, 'entries', (s) => [...s]);
   def(E, 'size', (s) => null);
-  def(E, 'with_index', (s, a, blk) => { const off = a[0] != null ? numVal(a[0]) : 0; if (!blk) return mkEnum(function* () { let i = off; for (const x of s) yield [x, i++]; }); const out = []; let i = off; for (const x of s) out.push(callBlock(blk, [x, i++])); return out; });
+  def(E, 'with_index', (s, a, blk) => { const off = a[0] != null ? numVal(a[0]) : 0; if (!blk) return mkEnum(function* () { let i = off; for (const x of s) yield [x, i++]; }); if (s._reinvoke) { let i = off; return s._reinvoke(makeProc((args) => callBlock(blk, [...args, i++]))); } const out = []; let i = off; for (const x of s) out.push(callBlock(blk, [x, i++])); return out; });
   def(E, 'each_with_index', (s, a, blk) => send(s, 'with_index', [0], blk));
   def(E, 'with_object', (s, a, blk) => { const obj = a[0]; for (const x of s) callBlock(blk, [x, obj]); return obj; });
   def(E, 'each_with_object', E.methods.get('with_object'));
   // generic Enumerable methods materialize then delegate to Array
   for (const name of ['map', 'collect', 'select', 'filter', 'reject', 'find', 'detect',
-    'reduce', 'inject', 'sum', 'min', 'max', 'min_by', 'max_by', 'sort', 'sort_by',
-    'count', 'include?', 'group_by', 'partition', 'flat_map', 'all?', 'any?', 'none?',
-    'tally', 'drop', 'each_slice', 'each_cons', 'zip', 'find_index', 'uniq', 'filter_map', 'reverse_each']) {
+    'reduce', 'inject', 'sum', 'min', 'max', 'min_by', 'max_by', 'minmax', 'minmax_by', 'sort', 'sort_by',
+    'count', 'include?', 'group_by', 'partition', 'flat_map', 'collect_concat', 'all?', 'any?', 'none?', 'one?',
+    'tally', 'take', 'take_while', 'drop', 'drop_while', 'each_slice', 'each_cons', 'chunk', 'chunk_while',
+    'slice_when', 'zip', 'find_index', 'find_all', 'uniq', 'filter_map', 'reverse_each', 'to_h', 'sort_by']) {
     def(E, name, (s, a, blk) => send([...s], name, a, blk));
   }
   def(E, 'inspect', (s) => new RString('#<Enumerator>'));
@@ -2581,7 +2720,7 @@ function installException() {
   def(ExceptionC, 'inspect', (s) => new RString('#<' + s.rclass.name + ': ' + jsstr(send(s, 'message', [])) + '>'));
   def(ExceptionC, 'backtrace', () => []);
   def(ExceptionC, 'set_backtrace', () => []);
-  def(ExceptionC, 'cause', () => null);
+  def(ExceptionC, 'cause', (s) => (s.ivars && s.ivars['@__cause'] != null ? s.ivars['@__cause'] : null));
   def(ExceptionC, 'exception', (s, a) => { if (a.length === 0) return s; const o = new RObject(s.rclass); o.ivars['@message'] = a[0] instanceof RString ? a[0] : new RString(toS(a[0])); return o; });
   sdef(ExceptionC, 'exception', (cls, a) => { const o = new RObject(cls); const init = findMethod(cls, 'initialize'); if (init) init(o, a); return o; });
   def(KeyErrorC, 'key', (s) => (s.ivars['@key'] ?? null));
@@ -2620,6 +2759,7 @@ function installStruct() {
     klass.methods.set('deconstruct', klass.methods.get('to_a'));
     klass.methods.set('values', klass.methods.get('to_a'));
     klass.methods.set('to_h', (self) => { const h = new RHash(); for (const m of members) h.set(R.sym(m), self.ivars['@' + m] ?? null); return h; });
+    klass.methods.set('deconstruct_keys', (self) => { const h = new RHash(); for (const m of members) h.set(R.sym(m), self.ivars['@' + m] ?? null); return h; });
     klass.methods.set('each', (self, aa, b) => { for (const m of members) callBlock(b, [self.ivars['@' + m] ?? null]); return self; });
     klass.methods.set('each_pair', (self, aa, b) => { for (const m of members) callBlock(b, [R.sym(m), self.ivars['@' + m] ?? null]); return self; });
     klass.methods.set('[]', (self, aa) => { const k = aa[0]; if (isInt(k)) { const m = members[k < 0 ? k + members.length : k]; return self.ivars['@' + m] ?? null; } const n = k instanceof RSymbol ? k.name : jsstr(k); return self.ivars['@' + n] ?? null; });
@@ -2957,6 +3097,7 @@ function installNodeCore() {
     klass.methods.set('members', () => members.map((m) => R.sym(m)));
     klass.methods.set('to_h', (self) => { const h = new RHash(); for (const m of members) h.set(R.sym(m), self.ivars['@' + m] ?? null); return h; });
     klass.methods.set('deconstruct', (self) => members.map((m) => self.ivars['@' + m] ?? null));
+    klass.methods.set('deconstruct_keys', (self) => { const h = new RHash(); for (const m of members) h.set(R.sym(m), self.ivars['@' + m] ?? null); return h; });
     klass.methods.set('with', (self, aa) => { const o = new RObject(self.rclass); Object.assign(o.ivars, self.ivars); if (aa[0] instanceof RHash) for (const [k, v] of aa[0].entries()) o.ivars['@' + symstr(k)] = v; return o; });
     klass.methods.set('==', (self, aa) => { const o = aa[0]; if (!(o instanceof RObject) || o.rclass !== self.rclass) return false; return members.every((m) => rbEqual(self.ivars['@' + m] ?? null, o.ivars['@' + m] ?? null)); });
     klass.methods.set('inspect', (self) => { const nm = self.rclass.name ? ' ' + self.rclass.name : ''; return new RString(`#<data${nm} ${members.map((m) => `${m}=${inspect(self.ivars['@' + m] ?? null)}`).join(', ')}>`); });
