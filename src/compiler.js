@@ -270,6 +270,26 @@ function collectParamNames(params) {
   return names;
 }
 
+// Proc/lambda arity per Ruby rules. Count = required positional (+1 if any
+// required keyword). The result is negated and decremented when the count is
+// "variable": rest/kwrest/optional-keyword always make it variable; an optional
+// positional makes it variable only for lambdas (non-lambda procs report the
+// mandatory count instead — the documented Proc#arity exception).
+function procArity(params) {
+  let req = 0, opt = false, rest = false, reqKey = 0, optKey = false, kwrest = false;
+  for (const p of params || []) {
+    if (p.kind === 'req' || p.kind === 'destructure') req++;
+    else if (p.kind === 'opt') opt = true;
+    else if (p.kind === 'rest') rest = true;
+    else if (p.kind === 'key') { if (p.default == null) reqKey++; else optKey = true; }
+    else if (p.kind === 'kwrest') kwrest = true;
+  }
+  const n = req + (reqKey > 0 ? 1 : 0);
+  // n = mandatory count; v = variable regardless of proc/lambda; o = has an
+  // optional positional (only makes a lambda variable). Resolved at call time.
+  return `{n:${n},v:${rest || kwrest || optKey},o:${opt}}`;
+}
+
 // ---- Pass 2: code generation ---------------------------------------------
 export class Compiler {
   constructor() {
@@ -277,6 +297,7 @@ export class Compiler {
     this.scope = null;
     this.classRef = '$cls';
     this.methodName = null;
+    this.methodParams = null;
     this.ctx = []; // 'loop' | 'block'
     // Current JS expression for Ruby `self`. Method bodies use the `$self`
     // parameter; blocks/lambdas use a rebindable `$sfN` (so instance_eval /
@@ -387,7 +408,7 @@ export class Compiler {
   // ---- expressions --------------------------------------------------------
   gen(node) {
     switch (node.type) {
-      case 'IntLit': return String(node.value);
+      case 'IntLit': return typeof node.value === 'bigint' ? `${node.value}n` : String(node.value);
       case 'FloatLit': return `R.float(${node.value})`;
       case 'MatchPred': case 'MatchAssign': return this.genMatchOp(node);
       case 'RationalLit': return `R.rational(${node.num}, ${node.den})`;
@@ -461,15 +482,34 @@ export class Compiler {
 
   // Emit a `function ($self, $args, $blk) {...}` for a def/singleton-def body.
   genMethodFn(node) {
-    const prevMethod = this.methodName;
+    const prevMethod = this.methodName, prevParams = this.methodParams;
     this.methodName = node.name;
+    this.methodParams = node.params;
     const fn = this.withScope(node.__scope, ['method'], '$dc', '$self', () => {
       const bind = this.genParamBinding(node.params, false);
       const body = this.genFnBody(node.body, node.__scope, { wrapReturn: true });
       return `function ($self, $args, $blk) {\n${bind}\n${body}\n}`;
     });
     this.methodName = prevMethod;
+    this.methodParams = prevParams;
     return fn;
+  }
+
+  // Reconstruct the argument list a bare `super` forwards: the *current* values
+  // of the enclosing method's parameters (so applied defaults are included).
+  superForwardArgs() {
+    const params = this.methodParams;
+    if (!params) return '$args';
+    const pos = []; const kw = [];
+    for (const p of params) {
+      if (p.kind === 'req' || p.kind === 'opt') pos.push(this.local(p.name));
+      else if (p.kind === 'rest') { if (p.name) pos.push(`...R.splat(${this.local(p.name)})`); }
+      else if (p.kind === 'destructure') { /* uncommon in super forwarding */ }
+      else if (p.kind === 'key') kw.push(`[R.sym(${this.q(p.name)}), ${this.local(p.name)}]`);
+      else if (p.kind === 'kwrest') { if (p.name) kw.push(`...${this.local(p.name)}.entries()`); }
+    }
+    if (kw.length) pos.push(`R.hash([${kw.join(', ')}])`);
+    return `[${pos.join(', ')}]`;
   }
 
   // Emit a `function ($cls) {...}` class/module body builder. `nestingPath` is
@@ -936,7 +976,7 @@ export class Compiler {
     const bind = this.genParamBinding(node.params, false);
     const body = this.genFnBody(node.body, scope, { wrapReturn: true });
     this.scope = prevScope; this.ctx = prevCtx; this.selfRef = prevSelf;
-    return `R.makeProc(function ($args, $self2) {\nconst ${sf} = ($self2 == null ? ${prevSelf} : $self2);\n${bind}\n${body}\n}, true)`;
+    return `R.makeProc(function ($args, $self2) {\nconst ${sf} = ($self2 == null ? ${prevSelf} : $self2);\n${bind}\n${body}\n}, true, ${procArity(node.params)})`;
   }
 
   genBlockNode(block) {
@@ -948,7 +988,7 @@ export class Compiler {
     const decls = this.declList(scope);
     const body = this.genReturningBody(block.body);
     this.scope = prevScope; this.ctx = prevCtx; this.selfRef = prevSelf;
-    return `R.makeProc(function ($args, $self2) {\nconst ${sf} = ($self2 == null ? ${prevSelf} : $self2);\n${bind}\n${decls}\n${body}\n}, false)`;
+    return `R.makeProc(function ($args, $self2) {\nconst ${sf} = ($self2 == null ? ${prevSelf} : $self2);\n${bind}\n${decls}\n${body}\n}, false, ${procArity(block.params)})`;
   }
 
   // ---- parameter binding --------------------------------------------------
@@ -1047,7 +1087,7 @@ export class Compiler {
     // A block attached to `super do ... end` (or `&blk`) overrides the method's own $blk.
     const block = this.genBlockArg(node) || '$blk';
     if (node.args === null) {
-      return `R.superCall(${this.selfRef}, ${this.classRef}, ${this.q(this.methodName)}, $args, ${block})`;
+      return `R.superCall(${this.selfRef}, ${this.classRef}, ${this.q(this.methodName)}, ${this.superForwardArgs()}, ${block})`;
     }
     return `R.superCall(${this.selfRef}, ${this.classRef}, ${this.q(this.methodName)}, [${this.genArgs(node.args)}], ${block})`;
   }

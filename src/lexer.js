@@ -230,7 +230,8 @@ export class Lexer {
       while (p < this.src.length && re.test(this.src[p])) { if (this.src[p] !== '_') digits += this.src[p]; p++; }
       if (digits.length) {
         this.pos = p;
-        this.push('INT', parseInt(digits, radix));
+        const n = parseInt(digits, radix);
+        this.push('INT', Number.isSafeInteger(n) ? n : BigInt(`0${kind}${digits}`));
         return;
       }
     }
@@ -268,7 +269,10 @@ export class Lexer {
       else this.push('RATIONAL', { num, den });
       return;
     }
-    this.push(isFloat ? 'FLOAT' : 'INT', isFloat ? parseFloat(text) : parseInt(text, 10));
+    if (isFloat) { this.push('FLOAT', parseFloat(text)); return; }
+    const n = parseInt(text, 10);
+    // Promote integer literals beyond double precision to BigInt (Bignum).
+    this.push('INT', Number.isSafeInteger(n) ? n : BigInt(text));
   }
 
   scanVar(type, prefixLen) {
