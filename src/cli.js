@@ -12,6 +12,8 @@ import { compile } from './compiler.js';
 import R, { RubyError } from './runtime.js';
 import { installLoader, executeFile, executeSource, requireFeature, runAtExit } from './loader.js';
 
+const VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+
 function main(argv) {
   const args = argv.slice(2);
   let dump = false;
@@ -31,7 +33,7 @@ function main(argv) {
     else if (a.startsWith('-r') && a.length > 2) requires.push(a.slice(2));
     else if (a === '-h' || a === '--help') { printHelp(); return 0; }
     else if (a === '-v' || a === '--version') {
-      console.log('v8ruby 0.1.0 (on Node ' + process.version + ', V8 ' + process.versions.v8 + ')');
+      console.log('v8ruby ' + VERSION + ' (on Node ' + process.version + ', V8 ' + process.versions.v8 + ')');
       return 0;
     } else if (!a.startsWith('-')) {
       file = a;
