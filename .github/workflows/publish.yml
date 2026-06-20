@@ -1,0 +1,44 @@
+name: Publish to npm
+
+# Publishes the package to npm using Trusted Publishing (OIDC) — no tokens.
+# Triggered when a GitHub Release is published, or manually.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # required for npm Trusted Publishing (OIDC)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted Publishing requires npm >= 11.5.1; refresh the bundled npm.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Show versions
+        run: |
+          node --version
+          npm --version
+
+      # Smoke test: the package has no dependencies, so just verify the
+      # compiler/runtime loads and the bin executes a small Ruby program.
+      - name: Smoke test
+        run: |
+          printf 'puts "v8ruby smoke %s" %% RUBY_VERSION\nputs (1..5).map { |x| x * x }.inspect\n' > /tmp/smoke.rb
+          node bin/ruby.js /tmp/smoke.rb
+
+      - name: Publish
+        run: npm publish
