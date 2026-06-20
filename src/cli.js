@@ -1,5 +1,5 @@
-#!/usr/bin/env node
-// v8ruby: compile a Ruby program to JavaScript and run it on V8 (Node).
+// v8ruby CLI: compile a Ruby program to JavaScript and run it on V8 (Node).
+// Invoked via the executable wrapper at the repository root (./v8ruby).
 //
 //   v8ruby program.rb            run a file
 //   v8ruby -e 'puts 1+1'         run a one-liner
@@ -8,9 +8,9 @@
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { compile } from '../src/compiler.js';
-import R, { RubyError } from '../src/runtime.js';
-import { installLoader, executeFile, executeSource, requireFeature, runAtExit } from '../src/loader.js';
+import { compile } from './compiler.js';
+import R, { RubyError } from './runtime.js';
+import { installLoader, executeFile, executeSource, requireFeature, runAtExit } from './loader.js';
 
 function main(argv) {
   const args = argv.slice(2);

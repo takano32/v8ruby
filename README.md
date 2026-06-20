@@ -42,11 +42,13 @@ point, `R.send(recv, name, args, block)`, so Ruby semantics are preserved:
 ## Usage
 
 ```sh
-bin/ruby.js program.rb        # run a file
-bin/ruby.js -e 'puts 1 + 1'   # run a one-liner
-bin/ruby.js --dump program.rb # print the generated JavaScript
-bin/ruby.js -v                # version (shows the underlying V8 version)
+./v8ruby program.rb        # run a file
+./v8ruby -e 'puts 1 + 1'   # run a one-liner
+./v8ruby --dump program.rb # print the generated JavaScript
+./v8ruby -v                # version (shows the underlying V8 version)
 ```
+
+Installed from npm (`npm install -g v8ruby`), the same command is available as `v8ruby`.
 
 (No build step and no dependencies — just Node.js.)
 

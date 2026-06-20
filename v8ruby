@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+// v8ruby executable: thin wrapper that runs the CLI in src/cli.js.
+import './src/cli.js';

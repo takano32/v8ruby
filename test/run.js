@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const casesDir = join(__dirname, 'cases');
-const v8ruby = join(__dirname, '..', 'bin', 'ruby.js');
+const v8ruby = join(__dirname, '..', 'v8ruby');
 
 function run(cmd, args) {
   try {
