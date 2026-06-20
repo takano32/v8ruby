@@ -38,7 +38,7 @@ jobs:
       - name: Smoke test
         run: |
           printf 'puts "v8ruby smoke %s" %% RUBY_VERSION\nputs (1..5).map { |x| x * x }.inspect\n' > /tmp/smoke.rb
-          node bin/ruby.js /tmp/smoke.rb
+          ./v8ruby /tmp/smoke.rb
 
       - name: Publish
         run: npm publish
